@@ -19,23 +19,20 @@
     <Description>High-performance, AOT-compatible C# FFI bindings for the SeekStorm search library</Description>
     <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
     <PackageTags>search;full-text;seekstorm;ffi;nativeaot</PackageTags>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageProjectUrl>https://github.com/scottgal/seekstorm-csharp</PackageProjectUrl>
 
     <!-- JSON source generator -->
     <JsonSerializerIsReflectionEnabledByDefault>false</JsonSerializerIsReflectionEnabledByDefault>
   </PropertyGroup>
 
   <!-- Platform-specific native binaries packed alongside the managed assembly -->
+  <!-- Uses glob pattern; only existing directories are included -->
   <ItemGroup>
-    <None Include="../../runtimes/win-x64/native/seekstorm_ffi.dll"
-          Pack="true" PackagePath="runtimes/win-x64/native/seekstorm_ffi.dll" />
-    <None Include="../../runtimes/linux-x64/native/libseekstorm_ffi.so"
-          Pack="true" PackagePath="runtimes/linux-x64/native/libseekstorm_ffi.so" />
-    <None Include="../../runtimes/linux-arm64/native/libseekstorm_ffi.so"
-          Pack="true" PackagePath="runtimes/linux-arm64/native/libseekstorm_ffi.so" />
-    <None Include="../../runtimes/osx-x64/native/libseekstorm_ffi.dylib"
-          Pack="true" PackagePath="runtimes/osx-x64/native/libseekstorm_ffi.dylib" />
-    <None Include="../../runtimes/osx-arm64/native/libseekstorm_ffi.dylib"
-          Pack="true" PackagePath="runtimes/osx-arm64/native/libseekstorm_ffi.dylib" />
+    <None Include="../../runtimes/**/native/*"
+          Pack="true" PackagePath="runtimes/%(RecursiveDir)/%(Filename)%(Extension)" />
+    <None Include="../../README.md"
+          Pack="true" PackagePath="/" />
   </ItemGroup>
 
 </Project>
