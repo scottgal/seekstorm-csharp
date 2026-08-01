@@ -24,11 +24,11 @@ public sealed class IndexHandle : SafeHandle
 
 /// <summary>
 /// P/Invoke declarations for the seekstorm-ffi cdylib. All interop is
-/// isolated in this class — nowhere else in the SDK touches DllImport.
+/// isolated in this class. Nowhere else in the SDK touches DllImport.
 /// </summary>
 internal static unsafe class NativeMethods
 {
-    // Native library name — runtime resolves per-platform:
+    // Native library name. Runtime resolves per-platform:
     //   Windows: seekstorm_ffi.dll
     //   Linux:   libseekstorm_ffi.so
     //   macOS:   libseekstorm_ffi.dylib

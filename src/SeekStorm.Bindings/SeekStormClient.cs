@@ -34,7 +34,7 @@ public sealed class SeekStormClient : IDisposable
     /// <param name="indexPath">Filesystem path for the index directory.</param>
     /// <param name="meta">Index metadata (similarity, tokenizer, etc.).</param>
     /// <param name="schema">Schema field definitions.</param>
-    /// <param name="segmentBits">2^N index segments (default 11 → 2048).</param>
+    /// <param name="segmentBits">2^N index segments (default 11 = 2048).</param>
     public unsafe void CreateIndex(
         string indexPath, IndexMeta meta, SchemaField[] schema, int segmentBits = 11)
     {
@@ -189,7 +189,7 @@ public sealed class SeekStormClient : IDisposable
 
     /// <summary>
     /// Search the index. Returns deserialized results.
-    /// This is the hot path — keep allocations minimal.
+    /// This is the hot path. Keep allocations minimal.
     /// </summary>
     public unsafe SearchResult Search(SearchRequest request)
     {
@@ -291,7 +291,7 @@ public sealed class SeekStormClient : IDisposable
     /// </summary>
     public void UpdateDocuments(List<UpdateDocument> updates)
     {
-        // Serialize as [[id, doc], [id, doc], ...] — the FFI expects Vec<(u64, Value)>
+        // Serialize as [[id, doc], [id, doc], ...]. The FFI expects Vec<(u64, Document)>
         var sb = new StringBuilder();
         sb.Append('[');
         for (int i = 0; i < updates.Count; i++)

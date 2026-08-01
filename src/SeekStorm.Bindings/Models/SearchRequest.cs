@@ -39,7 +39,7 @@ public sealed class SearchRequest
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
     public bool Realtime { get; set; }
 
-    /// <summary>Enable empty query — iterates all documents.</summary>
+    /// <summary>Enable empty query. Iterates all documents.</summary>
     [JsonPropertyName("enable_empty_query")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
     public bool EnableEmptyQuery { get; set; }

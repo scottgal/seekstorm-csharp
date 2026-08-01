@@ -2,55 +2,47 @@
 
 [![NuGet](https://img.shields.io/badge/nuget-v0.1.0-blue)](https://www.nuget.org/packages/SeekStorm.Bindings)
 [![.NET](https://img.shields.io/badge/.NET-10.0-purple)](https://dotnet.microsoft.com/)
-[![NativeAOT](https://img.shields.io/badge/NativeAOT-ready-green)](#)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
 
-High-performance, **NativeAOT-compatible C# FFI bindings** for the [SeekStorm](https://github.com/SeekStorm/SeekStorm) search library. Embed sub-millisecond vector & lexical search directly in your .NET application — no server, no HTTP.
+C# FFI bindings for the [SeekStorm](https://github.com/SeekStorm/SeekStorm) search library. Embed sub-millisecond vector and lexical search directly in your .NET application with no server and no HTTP.
 
 ```
-┌────────────────────────────────────────────┐
-│  Your .NET 10 AOT App                      │
-│  ┌──────────────────────────────────────┐  │
-│  │  SeekStormClient (C# public API)    │  │
-│  │  .Search("hello world")              │  │
-│  │  .IndexDocument(json)                │  │
-│  │  .CreateIndex(path, meta, schema)    │  │
-│  └──────────────┬───────────────────────┘  │
-│                 │ P/Invoke (C-ABI)          │
-│  ┌──────────────▼───────────────────────┐  │
-│  │  libseekstorm_ffi (Rust cdylib)     │  │
-│  │  JSON-at-boundary, tokio-driven      │  │
-│  └──────────────┬───────────────────────┘  │
-│                 │                          │
-│  ┌──────────────▼───────────────────────┐  │
-│  │  seekstorm crate v3.3 (Rust lib)    │  │
-│  │  BM25F · vectors · faceting · geo    │  │
-│  └──────────────────────────────────────┘  │
-└────────────────────────────────────────────┘
+Your .NET 10 AOT App
+│
+├── SeekStormClient (C# public API)
+│   ├── .Search(query)
+│   ├── .IndexDocument(json)
+│   └── .CreateIndex(path, meta, schema)
+│
+├── libseekstorm_ffi (Rust cdylib, C-ABI)
+│   JSON at boundary, tokio runtime
+│
+└── seekstorm crate v3.3 (Rust lib)
+    BM25F, vectors, faceting, geo
 ```
 
 ## Features
 
 | Category | Capabilities |
 |---|---|
-| **Lexical search** | BM25F / BM25F_Proximity, intersection/union/phrase/not queries |
-| **Vector search** | ANN with clustering, F32/I8 precision, cosine/dot/euclidean |
-| **Hybrid search** | Combined lexical + vector with Reciprocal Rank Fusion |
-| **Faceting** | Numeric ranges (U8-F64), string facets, histogram aggregation |
-| **Geo search** | Proximity filtering + distance sorting (km/miles) |
-| **Typo tolerance** | Query rewriting, spelling correction, instant search |
-| **Documents** | Index, batch, update, delete (by ID or query), iterator |
-| **Real-time** | Documents searchable the millisecond they're indexed |
+| Lexical search | BM25F and BM25F_Proximity, intersection/union/phrase/not queries |
+| Vector search | ANN with clustering, F32/I8 precision, cosine/dot/euclidean similarity |
+| Hybrid search | Lexical and vector combined with Reciprocal Rank Fusion |
+| Faceting | Numeric range facets (U8 through F64), string facets, histogram aggregation |
+| Geo search | Proximity filtering and distance sorting (km/miles) |
+| Typo tolerance | Query rewriting, spelling correction, query completion |
+| Documents | Index, batch, update, delete by ID or query, document iterator |
+| Real-time | Documents searchable immediately after indexing |
 
 ## Quick start
 
-### 1. Install the NuGet package
+Install the package:
 
 ```bash
 dotnet add package SeekStorm.Bindings
 ```
 
-### 2. Use it
+Usage:
 
 ```csharp
 using SeekStorm.Bindings;
@@ -91,46 +83,40 @@ request.ResultSort = [new ResultSort { Field = "price", Order = "Ascending" }];
 // Typo tolerance
 request.Query = "dokument";
 request.QueryRewriting = JsonNode.Parse("""{"mode":"SearchRewrite","distance":2,"correct_threshold":3}""")!.AsObject();
-// → automatically corrects to "document" and returns results + suggestions
 
 client.Dispose();
 ```
 
 ## AOT publishing
 
-The SDK is fully NativeAOT-compatible:
+The SDK supports NativeAOT. Publish with:
 
 ```bash
 dotnet publish -c Release -r osx-arm64 /p:PublishAot=true
 ```
 
-- Zero reflection — all JSON via System.Text.Json source generators
-- No runtime codegen — `IsAotCompatible=true`
-- SafeHandle for all native resources — no IntPtr leaks
-- Stack-allocated buffers for small JSON, ArrayPool for large payloads
+All serialization uses System.Text.Json source generators. No reflection, no runtime codegen. Native handles use SafeHandle. Buffers under 4KB are stack-allocated; larger payloads use ArrayPool.
 
 ## Platforms
 
-| Platform | RID | Status |
-|---|---|---|
-| macOS ARM64 | `osx-arm64` | ✅ Built & tested |
-| macOS x64 | `osx-x64` | ✅ Supported |
-| Linux x64 | `linux-x64` | ✅ Supported |
-| Linux ARM64 | `linux-arm64` | ✅ Supported |
-| Windows x64 | `win-x64` | ✅ Supported |
+| Platform | RID |
+|---|---|
+| macOS ARM64 | `osx-arm64` |
+| macOS x64 | `osx-x64` |
+| Linux x64 | `linux-x64` |
+| Linux ARM64 | `linux-arm64` |
+| Windows x64 | `win-x64` |
 
 ## Building from source
 
-```bash
-# Prerequisites
-# - Rust 1.97+ (install: https://rustup.rs)
-# - .NET SDK 10.0+
+Prerequisites: Rust 1.97+ and .NET SDK 10.0+
 
+```bash
 # Build the Rust FFI crate
 cd src/seekstorm-ffi
 cargo build --release
 
-# Copy to runtimes
+# Copy to runtimes directory
 mkdir -p ../../runtimes/osx-arm64/native
 cp target/release/libseekstorm_ffi.dylib ../../runtimes/osx-arm64/native/
 
@@ -138,7 +124,7 @@ cp target/release/libseekstorm_ffi.dylib ../../runtimes/osx-arm64/native/
 cd ../SeekStorm.Bindings
 dotnet build -c Release
 
-# Run tests (set SKIP_INTEGRATION_TESTS=0 with native binary)
+# Run tests
 dotnet test
 
 # Run benchmarks
@@ -148,13 +134,13 @@ dotnet run -c Release
 
 ## Architecture
 
-This is a **two-layer FFI SDK**:
+Two crates:
 
-1. **`src/seekstorm-ffi`** (Rust cdylib) — C-ABI wrapper around the `seekstorm` crate. JSON at the boundary, tokio-driven internally.
-2. **`src/SeekStorm.Bindings`** (C# classlib, net10.0) — Public API with P/Invoke interop, SafeHandle wrappers, and source-generated JSON.
+1. `src/seekstorm-ffi` (Rust cdylib). C-ABI wrapper around the `seekstorm` crate. JSON at the boundary, tokio runtime internally.
+2. `src/SeekStorm.Bindings` (C# classlib, net10.0). Public API with P/Invoke interop, SafeHandle wrappers, and source-generated JSON serialization.
 
-Documents and results cross the FFI boundary as **UTF-8 JSON** — the same format SeekStorm's own REST API uses. This avoids complex struct marshaling and stays compatible with SeekStorm's field-type richness.
+Documents and results cross the FFI boundary as UTF-8 JSON, matching the format SeekStorm's own REST API uses. This avoids struct marshaling and stays compatible with all SeekStorm field types.
 
 ## License
 
-Apache 2.0 — matches [SeekStorm's license](https://github.com/SeekStorm/SeekStorm).
+Apache 2.0, matching [SeekStorm's license](https://github.com/SeekStorm/SeekStorm).
