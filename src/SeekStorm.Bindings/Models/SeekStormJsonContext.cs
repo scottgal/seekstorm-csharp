@@ -8,7 +8,7 @@ namespace SeekStorm.Bindings.Models;
 /// Every type that crosses the FFI boundary as JSON must be listed here.
 /// </summary>
 [JsonSourceGenerationOptions(
-    GenerationMode = JsonSourceGenerationMode.Serialization,
+    GenerationMode = JsonSourceGenerationMode.Default,
     PropertyNamingPolicy = JsonKnownNamingPolicy.CamelCase,
     DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
     WriteIndented = false)]
@@ -35,6 +35,8 @@ namespace SeekStorm.Bindings.Models;
 [JsonSerializable(typeof(QueryRewritingConfig))]
 [JsonSerializable(typeof(IteratorRequest))]
 [JsonSerializable(typeof(IteratorResult))]
+[JsonSerializable(typeof(IteratorResultItem))]
+[JsonSerializable(typeof(List<IteratorResultItem>))]
 [JsonSerializable(typeof(List<ulong>))]
 [JsonSerializable(typeof(ulong[]))]
 [JsonSerializable(typeof(Dictionary<string, object>))]

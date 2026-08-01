@@ -1,3 +1,4 @@
+using System.Text.Json.Nodes;
 using System.Text.Json.Serialization;
 
 namespace SeekStorm.Bindings.Models;
@@ -69,14 +70,14 @@ public sealed class IndexMeta
     /// </summary>
     [JsonPropertyName("spelling_correction")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
-    public object? SpellingCorrection { get; set; }
+    public JsonObject? SpellingCorrection { get; set; }
 
     /// <summary>
     /// Query completion / instant search configuration. Null = disabled.
     /// </summary>
     [JsonPropertyName("query_completion")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
-    public object? QueryCompletion { get; set; }
+    public JsonObject? QueryCompletion { get; set; }
 
     /// <summary>
     /// Clustering mode: "None" (default).
@@ -89,7 +90,7 @@ public sealed class IndexMeta
     /// </summary>
     [JsonPropertyName("inference")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
-    public object? Inference { get; set; }
+    public JsonObject? Inference { get; set; }
 }
 
 /// <summary>

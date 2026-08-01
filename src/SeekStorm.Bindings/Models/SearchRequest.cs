@@ -119,7 +119,7 @@ public sealed class ResultSort
     /// <summary>Base value for sorting: None, a point [lat,lon], or a numeric value.</summary>
     [JsonPropertyName("base")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
-    public object? Base { get; set; }
+    public JsonNode? Base { get; set; }
 }
 
 /// <summary>
@@ -196,7 +196,7 @@ public sealed class SearchResult
     /// <summary>Facet results when query_facets were requested.</summary>
     [JsonPropertyName("facets")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
-    public JsonArray? Facets { get; set; }
+    public JsonNode? Facets { get; set; }
 }
 
 public sealed class SearchHit
@@ -232,27 +232,34 @@ public sealed class Suggestion
 /// </summary>
 public sealed class IteratorRequest
 {
-    /// <summary>Start offset (0-based).</summary>
-    [JsonPropertyName("offset")]
-    public ulong Offset { get; set; }
+    /// <summary>Start from this document ID (null = start/end of index).</summary>
+    [JsonPropertyName("docid")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public ulong? DocId { get; set; }
 
-    /// <summary>Number of documents to return.</summary>
-    [JsonPropertyName("length")]
-    public ulong Length { get; set; } = 100;
+    /// <summary>Number of document IDs to skip before returning results.</summary>
+    [JsonPropertyName("skip")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    public ulong Skip { get; set; }
 
-    /// <summary>Direction: true = forward, false = backward.</summary>
-    [JsonPropertyName("direction")]
-    public bool Direction { get; set; } = true;
+    /// <summary>Number to return. Positive = forward, negative = backward.</summary>
+    [JsonPropertyName("take")]
+    public long Take { get; set; } = 100;
 
-    /// <summary>Field names to include (null = all stored fields).</summary>
+    /// <summary>Include deleted documents in results.</summary>
+    [JsonPropertyName("include_deleted")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    public bool IncludeDeleted { get; set; }
+
+    /// <summary>Include full document bodies (field values).</summary>
+    [JsonPropertyName("include_document")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    public bool IncludeDocument { get; set; } = true;
+
+    /// <summary>Field names to include (empty = all stored fields).</summary>
     [JsonPropertyName("fields")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string[]? Fields { get; set; }
-
-    /// <summary>Include uncommitted documents.</summary>
-    [JsonPropertyName("include_uncommitted")]
-    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
-    public bool IncludeUncommitted { get; set; }
 }
 
 /// <summary>
@@ -260,9 +267,21 @@ public sealed class IteratorRequest
 /// </summary>
 public sealed class IteratorResult
 {
-    [JsonPropertyName("documents")]
-    public List<Dictionary<string, object?>> Documents { get; set; } = new();
+    [JsonPropertyName("skip")]
+    public ulong Skip { get; set; }
 
-    [JsonPropertyName("total_count")]
-    public ulong TotalCount { get; set; }
+    [JsonPropertyName("results")]
+    public List<IteratorResultItem> Results { get; set; } = new();
+}
+
+/// <summary>
+/// Single item from document iteration.
+/// </summary>
+public sealed class IteratorResultItem
+{
+    [JsonPropertyName("doc_id")]
+    public ulong DocId { get; set; }
+
+    [JsonPropertyName("doc")]
+    public Dictionary<string, object?>? Doc { get; set; }
 }

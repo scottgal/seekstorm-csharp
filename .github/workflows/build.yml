@@ -1,0 +1,111 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-native:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux-x64
+            binary: libseekstorm_ffi.so
+          - os: ubuntu-24.04-arm
+            target: linux-arm64
+            binary: libseekstorm_ffi.so
+          - os: macos-latest
+            target: osx-arm64
+            binary: libseekstorm_ffi.dylib
+          - os: macos-13
+            target: osx-x64
+            binary: libseekstorm_ffi.dylib
+          - os: windows-latest
+            target: win-x64
+            binary: seekstorm_ffi.dll
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: Build Rust FFI
+        run: cd src/seekstorm-ffi && cargo build --release
+
+      - name: Copy native binary
+        run: |
+          mkdir -p runtimes/${{ matrix.target }}/native
+          cp src/seekstorm-ffi/target/release/${{ matrix.binary }} runtimes/${{ matrix.target }}/native/
+        shell: bash
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Restore and build C#
+        run: dotnet build -c Release
+
+      - name: Copy native for smoke test
+        run: cp runtimes/${{ matrix.target }}/native/${{ matrix.binary }} test/SeekStorm.SmokeTest/bin/Release/net10.0/
+        shell: bash
+        continue-on-error: true
+
+      - name: Run smoke test
+        run: dotnet run --project test/SeekStorm.SmokeTest -c Release --no-build
+        if: runner.os != 'Windows'
+
+      - name: Run smoke test (Windows)
+        run: dotnet run --project test/SeekStorm.SmokeTest -c Release --no-build
+        if: runner.os == 'Windows'
+
+      - name: Run unit tests
+        run: dotnet test -c Release --no-build --filter "FullyQualifiedName~Model"
+        continue-on-error: true
+
+      - name: Upload native binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.target }}
+          path: runtimes/${{ matrix.target }}/native/
+
+  pack:
+    name: Pack NuGet
+    runs-on: ubuntu-latest
+    needs: build-native
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all native binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: native-*
+          path: runtimes
+          merge-multiple: true
+
+      - run: find runtimes -type f
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Pack
+        run: dotnet pack src/SeekStorm.Bindings -c Release -o nupkgs
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: nuget-package
+          path: nupkgs/*.nupkg
+
+      - name: Push to NuGet.org
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: dotnet nuget push nupkgs/*.nupkg --api-key ${{ secrets.NUGET_API_KEY }} --source https://api.nuget.org/v3/index.json

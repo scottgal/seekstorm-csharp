@@ -5,6 +5,9 @@
   <Folder Name="/src/">
     <Project Path="src/SeekStorm.Bindings/SeekStorm.Bindings.csproj" />
   </Folder>
+  <Folder Name="/test/">
+    <Project Path="test/SeekStorm.SmokeTest/SeekStorm.SmokeTest.csproj" />
+  </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/SeekStorm.Bindings.Tests/SeekStorm.Bindings.Tests.csproj" />
   </Folder>

@@ -318,15 +318,14 @@ public class SeekStormClientTests : IDisposable
 
         var result = _client!.IterateDocuments(new IteratorRequest
         {
-            Length = 10,
-            Direction = true,
-            IncludeUncommitted = false,
+            Take = 10,
+            IncludeDocument = true,
         });
 
         Assert.NotNull(result);
-        Assert.NotEmpty(result.Documents);
-        Assert.True(result.Documents.Count <= 10);
-        _output.WriteLine($"Iterator returned {result.Documents.Count} docs, total: {result.TotalCount}");
+        Assert.NotEmpty(result.Results);
+        Assert.True(result.Results.Count <= 10);
+        _output.WriteLine($"Iterator returned {result.Results.Count} docs");
     }
 
     // ── Typo tolerance ─────────────────────────────────────────────
