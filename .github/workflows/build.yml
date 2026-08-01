@@ -110,6 +110,12 @@ jobs:
           name: nuget-package
           path: nupkgs/*.nupkg
 
+      - name: NuGet login (OIDC)
+        uses: NuGet/login@v1
+        id: login
+        with:
+          user: mostlylucid
+
       - name: Push to NuGet.org
         if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
-        run: dotnet nuget push nupkgs/*.nupkg --source https://api.nuget.org/v3/index.json
+        run: dotnet nuget push nupkgs/*.nupkg --api-key ${{ steps.login.outputs.NUGET_API_KEY }} --source https://api.nuget.org/v3/index.json
