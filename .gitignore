@@ -1,0 +1,31 @@
+# Build outputs
+bin/
+obj/
+target/
+
+# Rust
+src/seekstorm-ffi/target/
+
+# IDE
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# NuGet
+*.nupkg
+*.snupkg
+
+# DeepCode
+.deepcode/
+
+# Runtimes (native binaries are built, not source)
+runtimes/
+
+# Styloagent (internal tooling)
+.styloagent/
