@@ -22,9 +22,6 @@ jobs:
           - os: macos-latest
             target: osx-arm64
             binary: libseekstorm_ffi.dylib
-          - os: macos-13
-            target: osx-x64
-            binary: libseekstorm_ffi.dylib
           - os: windows-latest
             target: win-x64
             binary: seekstorm_ffi.dll
