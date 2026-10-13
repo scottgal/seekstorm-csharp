@@ -29,3 +29,5 @@ runtimes/
 
 # Styloagent (internal tooling)
 .styloagent/
+
+.nuget-package-consumer.config

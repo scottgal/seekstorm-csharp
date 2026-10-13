@@ -1,6 +1,6 @@
 [package]
 name = "seekstorm-ffi"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 description = "C-ABI FFI bindings for the SeekStorm search library"
 license = "Apache-2.0"

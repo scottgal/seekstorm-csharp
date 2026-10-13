@@ -111,8 +111,13 @@ jobs:
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '10.0.x'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Configure package feeds without shell-dependent source arguments
+        run: python scripts/package-consumer-config.py
       - name: Restore actual package in isolated consumer
-        run: dotnet restore test/SeekStorm.PackageSmokeTest -r ${{ matrix.rid }} --source ./nupkgs --source https://api.nuget.org/v3/index.json
+        run: dotnet restore test/SeekStorm.PackageSmokeTest -r ${{ matrix.rid }} --configfile .nuget-package-consumer.config
       - name: Run package consumer without manual native copies
         run: dotnet run --project test/SeekStorm.PackageSmokeTest -c Release -r ${{ matrix.rid }} --no-restore
       - name: Publish NativeAOT consumer

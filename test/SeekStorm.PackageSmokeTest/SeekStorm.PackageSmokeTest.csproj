@@ -8,7 +8,7 @@
     <InvariantGlobalization>true</InvariantGlobalization>
   </PropertyGroup>
   <ItemGroup>
-    <PackageReference Include="SeekStorm.Bindings" Version="0.2.2" />
+    <PackageReference Include="SeekStorm.Bindings" Version="0.2.3" />
     <Compile Include="../SeekStorm.SmokeTest/Program.cs" Link="Program.cs" />
   </ItemGroup>
 </Project>
