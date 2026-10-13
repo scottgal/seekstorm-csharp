@@ -1,6 +1,6 @@
 # SeekStorm C# SDK
 
-[![NuGet](https://img.shields.io/badge/nuget-v0.2.0-blue)](https://www.nuget.org/packages/SeekStorm.Bindings)
+[![NuGet](https://img.shields.io/badge/nuget-v0.2.1-blue)](https://www.nuget.org/packages/SeekStorm.Bindings)
 [![.NET](https://img.shields.io/badge/.NET-10.0-purple)](https://dotnet.microsoft.com/)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
 
@@ -101,6 +101,8 @@ var hits = evidence.Search(new SearchRequest {
 `FieldFilter` selects searchable text fields; `FacetFilter` restricts documents. `Fields` hydrates the selected stored fields in `SearchHit.Document` (null means no hydration). `UpsertDocument(keyField, key, document)` and `DeleteDocumentByKey(keyField, key)` require a **stored String16 facet**. They commit their changes and preserve the logical key, not the engine's numeric document ID. Upsert is delete then insert; keep authoritative source data separately so an interrupted update can be rebuilt.
 
 SeekStorm 3.4.1's vector branch does not apply facet filters. This binding intersects the complete ranked candidate set with native lexical facet eligibility **before pagination**. This compatibility path supports up to 100,000 indexed documents and rejects larger filtered-vector queries explicitly. Facet aggregations are supported only in lexical mode; vector/hybrid aggregations fail explicitly because the engine computes them only for lexical candidates. It is intended for bounded evidence collections; it does not claim the performance of engine-level vector prefiltering. Lexical searches on external-vector indexes also supply an unused unit vector to work around the engine's unconditional vector requirement. Both behaviors have package-consumer regression checks.
+
+Union queries with facet filters also expose a 3.4.1 aggregation-slot bug. The binding initializes zero-length aggregation slots and removes its internal placeholder from results. Unwinding engine panics are caught at the C ABI boundary and returned as `SeekStormException`, so they do not unwind across P/Invoke. The smoke pipeline includes a multi-term union query with exact role filtering, and a Rust test verifies panic-to-error conversion.
 
 ## Verification and packaging
 

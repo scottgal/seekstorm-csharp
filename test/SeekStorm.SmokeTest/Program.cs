@@ -205,6 +205,15 @@ try
                     Require(ex.Message.Contains("facet aggregation"), "aggregation failed for unrelated reason");
                 }
             }
+            var unionFiltered = vectors.Search(new SearchRequest
+            {
+                Query = "production agent orchestration missingword",
+                QueryType = "Union",
+                FacetFilter = new JsonArray((JsonNode)SearchConfiguration.StringFacet("role", "role-a")),
+                Fields = ["key"]
+            });
+            Require(unionFiltered.Results.Count == 1 && unionFiltered.Results[0].Document?["key"]?.GetValue<string>() == "a", "union facet search failed");
+            Require(unionFiltered.Facets?.AsObject().ContainsKey("__seekstorm_binding_alignment__") != true, "internal alignment facet leaked");
             var hybrid = vectors.Search(new SearchRequest
             {
                 Query = "production agent",

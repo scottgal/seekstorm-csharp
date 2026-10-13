@@ -37,6 +37,8 @@ jobs:
           toolchain: stable
       - name: Build Rust FFI
         run: cargo build --release --locked --manifest-path src/seekstorm-ffi/Cargo.toml
+      - name: Verify native panic containment
+        run: cargo test --release --locked --manifest-path src/seekstorm-ffi/Cargo.toml
       - name: Stage runtime preserving RID and native directories
         shell: bash
         run: |

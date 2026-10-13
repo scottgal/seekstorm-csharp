@@ -109,6 +109,32 @@ fn validate_filters(index_arc: &IndexArc, req: &Value) -> Result<(), String> {
     Ok(())
 }
 
+// 3.4.1's Union facet-filter path assumes an aggregation slot for every facet.
+// Request a zero-length internal aggregation to initialize those slots without
+// collecting counts. Remove its synthetic output before crossing the boundary.
+const ALIGNMENT_FACET: &str = "__seekstorm_binding_alignment__";
+fn align_facets(mut facets: Vec<QueryFacet>, filters: &[FacetFilter]) -> Vec<QueryFacet> {
+    if facets.is_empty() && !filters.is_empty() {
+        facets.push(QueryFacet::String16 {
+            field: ALIGNMENT_FACET.into(),
+            prefix: String::new(),
+            length: 0,
+        });
+    }
+    facets
+}
+
+fn guarded<T>(action: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(action)).unwrap_or_else(|panic| {
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .unwrap_or("unknown engine panic");
+        Err(format!("native engine failure: {message}"))
+    })
+}
+
 // ── Public C-ABI exports ──────────────────────────────────────────────
 
 /// Create a new index. Returns null on success (out_json receives `{"id": N}`).
@@ -131,7 +157,7 @@ pub unsafe extern "C" fn seekstorm_create_index(
     out_handle: *mut *mut libc::c_void,
     out_json: *mut *mut c_char,
 ) -> *mut c_char {
-    match (|| -> Result<String, String> {
+    match guarded(|| -> Result<String, String> {
         let path = Path::new(cstr_to_str(index_path));
         let meta: IndexMetaObject = serde_json::from_str(cstr_to_str(meta_json))
             .map_err(|e| format!("invalid meta_json: {e}"))?;
@@ -159,7 +185,7 @@ pub unsafe extern "C" fn seekstorm_create_index(
             }
         }
         Ok(r#"{"status":"created"}"#.to_string())
-    })() {
+    }) {
         Ok(result) => {
             write_output(result, out_json);
             std::ptr::null_mut()
@@ -175,7 +201,7 @@ pub unsafe extern "C" fn seekstorm_open_index(
     out_handle: *mut *mut libc::c_void,
     out_json: *mut *mut c_char,
 ) -> *mut c_char {
-    match (|| -> Result<String, String> {
+    match guarded(|| -> Result<String, String> {
         let path = Path::new(cstr_to_str(index_path));
         let index_arc = runtime()
             .block_on(open_index(path))
@@ -188,7 +214,7 @@ pub unsafe extern "C" fn seekstorm_open_index(
             }
         }
         Ok(r#"{"status":"opened"}"#.to_string())
-    })() {
+    }) {
         Ok(result) => {
             write_output(result, out_json);
             std::ptr::null_mut()
@@ -214,14 +240,14 @@ pub unsafe extern "C" fn seekstorm_index_document(
     document_json: *const c_char,
     out_json: *mut *mut c_char,
 ) -> *mut c_char {
-    match (|| -> Result<String, String> {
+    match guarded(|| -> Result<String, String> {
         let index_arc = index_from_handle(handle);
         let doc: Document = serde_json::from_str(cstr_to_str(document_json))
             .map_err(|e| format!("invalid document_json: {e}"))?;
 
         runtime().block_on(index_arc.index_document(doc, seekstorm::index::FileType::None));
         Ok(r#"{"status":"indexed"}"#.to_string())
-    })() {
+    }) {
         Ok(result) => {
             write_output(result, out_json);
             std::ptr::null_mut()
@@ -237,14 +263,14 @@ pub unsafe extern "C" fn seekstorm_index_documents(
     documents_json: *const c_char,
     out_json: *mut *mut c_char,
 ) -> *mut c_char {
-    match (|| -> Result<String, String> {
+    match guarded(|| -> Result<String, String> {
         let index_arc = index_from_handle(handle);
         let docs: Vec<Document> = serde_json::from_str(cstr_to_str(documents_json))
             .map_err(|e| format!("invalid documents_json: {e}"))?;
 
         runtime().block_on(index_arc.index_documents(docs));
         Ok(r#"{"status":"indexed"}"#.to_string())
-    })() {
+    }) {
         Ok(result) => {
             write_output(result, out_json);
             std::ptr::null_mut()
@@ -260,14 +286,14 @@ pub unsafe extern "C" fn seekstorm_delete_documents(
     doc_ids_json: *const c_char,
     out_json: *mut *mut c_char,
 ) -> *mut c_char {
-    match (|| -> Result<String, String> {
+    match guarded(|| -> Result<String, String> {
         let index_arc = index_from_handle(handle);
         let ids: Vec<u64> = serde_json::from_str(cstr_to_str(doc_ids_json))
             .map_err(|e| format!("invalid doc_ids_json: {e}"))?;
 
         runtime().block_on(index_arc.delete_documents(ids));
         Ok(r#"{"status":"deleted"}"#.to_string())
-    })() {
+    }) {
         Ok(result) => {
             write_output(result, out_json);
             std::ptr::null_mut()
@@ -285,7 +311,7 @@ pub unsafe extern "C" fn seekstorm_delete_documents_by_query(
     request_json: *const c_char,
     out_json: *mut *mut c_char,
 ) -> *mut c_char {
-    match (|| -> Result<String, String> {
+    match guarded(|| -> Result<String, String> {
         let index_arc = index_from_handle(handle);
         let req: Value =
             json_from_cstr(request_json).map_err(|e| format!("invalid request_json: {e}"))?;
@@ -298,8 +324,9 @@ pub unsafe extern "C" fn seekstorm_delete_documents_by_query(
 
         let field_filter = serde_json::from_value(optional_array(&req, "field_filter"))
             .map_err(|e| format!("invalid field_filter: {e}"))?;
-        let facet_filter = serde_json::from_value(optional_array(&req, "facet_filter"))
-            .map_err(|e| format!("invalid facet_filter: {e}"))?;
+        let facet_filter: Vec<FacetFilter> =
+            serde_json::from_value(optional_array(&req, "facet_filter"))
+                .map_err(|e| format!("invalid facet_filter: {e}"))?;
         let result_sort = serde_json::from_value(optional_array(&req, "result_sort"))
             .map_err(|e| format!("invalid result_sort: {e}"))?;
         validate_filters(index_arc, &req)?;
@@ -322,7 +349,7 @@ pub unsafe extern "C" fn seekstorm_delete_documents_by_query(
             ResultType::Topk,
             include_uncommitted,
             field_filter,
-            Vec::new(),
+            align_facets(Vec::new(), &facet_filter),
             facet_filter,
             result_sort,
             QueryRewriting::SearchOnly,
@@ -337,7 +364,7 @@ pub unsafe extern "C" fn seekstorm_delete_documents_by_query(
             ),
         );
         Ok(r#"{"status":"deleted"}"#.to_string())
-    })() {
+    }) {
         Ok(result) => {
             write_output(result, out_json);
             std::ptr::null_mut()
@@ -352,11 +379,11 @@ pub unsafe extern "C" fn seekstorm_commit(
     handle: *mut libc::c_void,
     out_json: *mut *mut c_char,
 ) -> *mut c_char {
-    match (|| -> Result<String, String> {
+    match guarded(|| -> Result<String, String> {
         let index_arc = index_from_handle(handle);
         runtime().block_on(index_arc.commit());
         Ok(r#"{"status":"committed"}"#.to_string())
-    })() {
+    }) {
         Ok(result) => {
             write_output(result, out_json);
             std::ptr::null_mut()
@@ -373,7 +400,7 @@ pub unsafe extern "C" fn seekstorm_search(
     request_json: *const c_char,
     out_json: *mut *mut c_char,
 ) -> *mut c_char {
-    match (|| -> Result<String, String> {
+    match guarded(|| -> Result<String, String> {
         let index_arc = index_from_handle(handle);
         let req: Value =
             json_from_cstr(request_json).map_err(|e| format!("invalid request_json: {e}"))?;
@@ -479,7 +506,7 @@ pub unsafe extern "C" fn seekstorm_search(
                 ResultType::TopkCount,
                 include_uncommitted,
                 Vec::new(),
-                Vec::new(),
+                align_facets(Vec::new(), &facet_filter),
                 facet_filter.clone(),
                 Vec::new(),
                 QueryRewriting::SearchOnly,
@@ -509,12 +536,13 @@ pub unsafe extern "C" fn seekstorm_search(
             },
             include_uncommitted,
             field_filter,
-            query_facets,
+            align_facets(query_facets, &facet_filter),
             facet_filter,
             result_sort,
             query_rewriting,
         ));
 
+        result.facets.remove(ALIGNMENT_FACET);
         if let Some(allowed) = allowed {
             result.results.retain(|hit| allowed.contains(&hit.doc_id));
             result.result_count_total = result.results.len();
@@ -532,7 +560,7 @@ pub unsafe extern "C" fn seekstorm_search(
         let result_json =
             serde_json::to_string(&result).map_err(|e| format!("serialization failed: {e}"))?;
         Ok(result_json)
-    })() {
+    }) {
         Ok(result) => {
             write_output(result, out_json);
             std::ptr::null_mut()
@@ -548,7 +576,7 @@ pub unsafe extern "C" fn seekstorm_get_document(
     doc_id: usize,
     out_json: *mut *mut c_char,
 ) -> *mut c_char {
-    match (|| -> Result<String, String> {
+    match guarded(|| -> Result<String, String> {
         let index_arc = index_from_handle(handle);
         let index = runtime().block_on(index_arc.read());
 
@@ -563,7 +591,7 @@ pub unsafe extern "C" fn seekstorm_get_document(
             .map_err(|e| format!("get_document failed: {e}"))?;
 
         serde_json::to_string(&doc).map_err(|e| format!("serialization failed: {e}"))
-    })() {
+    }) {
         Ok(result) => {
             write_output(result, out_json);
             std::ptr::null_mut()
@@ -579,14 +607,14 @@ pub unsafe extern "C" fn seekstorm_update_documents(
     updates_json: *const c_char,
     out_json: *mut *mut c_char,
 ) -> *mut c_char {
-    match (|| -> Result<String, String> {
+    match guarded(|| -> Result<String, String> {
         let index_arc = index_from_handle(handle);
         let updates: Vec<(u64, Document)> = serde_json::from_str(cstr_to_str(updates_json))
             .map_err(|e| format!("invalid updates_json (expected [[id, doc], ...]): {e}"))?;
 
         runtime().block_on(index_arc.update_documents(updates));
         Ok(r#"{"status":"updated"}"#.to_string())
-    })() {
+    }) {
         Ok(result) => {
             write_output(result, out_json);
             std::ptr::null_mut()
@@ -604,7 +632,7 @@ pub unsafe extern "C" fn seekstorm_iterate_documents(
     request_json: *const c_char,
     out_json: *mut *mut c_char,
 ) -> *mut c_char {
-    match (|| -> Result<String, String> {
+    match guarded(|| -> Result<String, String> {
         let index_arc = index_from_handle(handle);
         let req: Value =
             json_from_cstr(request_json).map_err(|e| format!("invalid request_json: {e}"))?;
@@ -633,7 +661,7 @@ pub unsafe extern "C" fn seekstorm_iterate_documents(
         ));
 
         serde_json::to_string(&result).map_err(|e| format!("serialization failed: {e}"))
-    })() {
+    }) {
         Ok(result) => {
             write_output(result, out_json);
             std::ptr::null_mut()
@@ -716,16 +744,20 @@ fn parse_query_rewriting(req: &Value) -> QueryRewriting {
 
 // ── Tests ─────────────────────────────────────────────────────────────
 
-#[cfg(test)]
-mod tests {
-    // Integration tests belong in the C# layer; Rust-side tests
-    // here would need a live seekstorm index on disk.
-}
-
 fn optional_array(request: &Value, field: &str) -> Value {
     request
         .get(field)
         .filter(|value| !value.is_null())
         .cloned()
         .unwrap_or_else(|| Value::Array(Vec::new()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn engine_panics_become_errors() {
+        let result: Result<(), String> = guarded(|| panic!("synthetic engine failure"));
+        assert!(result.unwrap_err().contains("synthetic engine failure"));
+    }
 }
