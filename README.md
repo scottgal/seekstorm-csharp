@@ -1,6 +1,6 @@
 # SeekStorm C# SDK
 
-[![NuGet](https://img.shields.io/badge/nuget-v0.2.1-blue)](https://www.nuget.org/packages/SeekStorm.Bindings)
+[![NuGet](https://img.shields.io/badge/nuget-v0.2.2-blue)](https://www.nuget.org/packages/SeekStorm.Bindings)
 [![.NET](https://img.shields.io/badge/.NET-10.0-purple)](https://dotnet.microsoft.com/)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
 
@@ -26,13 +26,13 @@ Your .NET 10 AOT App
 | Category | Capabilities |
 |---|---|
 | Lexical search | BM25F and BM25F_Proximity, intersection/union/phrase/not queries |
-| Vector search | ANN with clustering, F32/I8 precision, cosine/dot/euclidean similarity |
+| Vector search | External F32 vectors, cosine/dot/euclidean similarity; typed Model2Vec configuration |
 | Hybrid search | Lexical and vector combined with Reciprocal Rank Fusion |
 | Faceting | Numeric range facets (U8 through F64), string facets, histogram aggregation |
-| Geo search | Proximity filtering and distance sorting (km/miles) |
-| Typo tolerance | Query rewriting, spelling correction, query completion |
+| Geo search | Point facet filtering; search highlight/distance enrichment is explicitly unsupported |
+| Query rewriting | Typed rewriting configuration; spelling dictionaries disabled because upstream 3.4.1 can panic during commit |
 | Documents | Index, batch, update, delete by ID or query, document iterator |
-| Real-time | Documents searchable immediately after indexing |
+| Visibility | Indexing queues work; Commit verifies submitted document counts and stored fields before durable reads |
 
 ## Quick start
 
@@ -168,3 +168,35 @@ Documents and results cross the FFI boundary as UTF-8 JSON, matching the format 
 ## License
 
 Apache 2.0, matching [SeekStorm's license](https://github.com/SeekStorm/SeekStorm).
+
+
+## Binding contract and upstream limits (0.2.2)
+
+This release pins **unmodified SeekStorm 3.4.1**. It does not fork or patch the engine.
+Embedded indexes currently require **one shard** and `segmentBits = 11`. This bounds the default 400 MB-per-shard posting buffer and makes submitted
+stored-field verification reliable. Multi-shard indexes must be rebuilt for this
+embedded contract. Upstream reopening hardcodes 11 segment bits; other values are
+rejected rather than creating an index that cannot be reopened. Typed fields must be omitted when absent; explicit nulls and
+unknown document keys are rejected, rather than silently coerced. Null JSON values
+remain valid except where an external-vector array is required.
+
+Spelling dictionary configuration is **rejected before index allocation**. Upstream
+3.4.1's dictionary commit can panic on an empty term; a current-engine update check
+found no released fix. Existing indexes enabling that option cannot be opened by
+this release. Resume retrieval does not use it. Highlights and distance-field
+search enrichment also fail explicitly until the binding implements them.
+
+Indexing submits asynchronous engine work. Commit checks expected document counts
+and fingerprints of stored fields. It cannot observe every upstream background
+failure: upstream auxiliary tasks may fail after documents were stored, and schemas
+without stored fields have count-only verification. Do not treat a successful call
+as a transactional guarantee across auxiliary engine structures. The CI smoke
+runner additionally fails on native panic/task-failure output.
+
+One client serializes its operations; raw C calls are also serialized per handle.
+Closing/freeing a raw handle still requires exclusive ownership. Use only one
+writer per index directory. Opening the same path on an active client is idempotent;
+recreating that active path is rejected. A failed switch to another path retains
+the original usable index. Symlink aliases and multiple-client writers are outside
+this ownership contract. Model2Vec configuration serialization is verified; model
+download/inference availability depends on the configured upstream model.

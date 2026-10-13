@@ -9,6 +9,10 @@ namespace SeekStorm.Bindings.Models;
 /// </summary>
 public sealed class IndexMeta
 {
+    /// <summary>Embedded bindings require one shard for verified document IDs and bounded memory. The engine reserves a 400 MB posting buffer per shard.</summary>
+    [JsonPropertyName("shard_count")]
+    public int ShardCount { get; set; } = 1;
+
     /// <summary>Internal ID (0 for auto-assign).</summary>
     [JsonPropertyName("id")]
     public ulong Id { get; set; }
@@ -66,7 +70,7 @@ public sealed class IndexMeta
     public string AccessType { get; set; } = "Mmap";
 
     /// <summary>
-    /// Spelling correction configuration. Null = disabled.
+    /// Reserved spelling configuration. Must be null with pinned engine 3.4.1; dictionary-enabled indexes are rejected.
     /// </summary>
     [JsonPropertyName("spelling_correction")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
@@ -98,13 +102,20 @@ public sealed class IndexMeta
 /// </summary>
 public sealed class SchemaField
 {
+    [JsonPropertyName("dictionary_source")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    public bool DictionarySource { get; set; }
+    [JsonPropertyName("completion_source")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    public bool CompletionSource { get; set; }
+
     /// <summary>Field name.</summary>
     [JsonPropertyName("field")]
     public string Field { get; set; } = string.Empty;
 
     /// <summary>
     /// Field type: "Text", "String16", "String32", "U8".."U64", "I8".."I64",
-    /// "F32", "F64", "Bool", "Timestamp", "Point", "Json", "Binary".
+    /// "F32", "F64", "Bool", "Timestamp", "Point", "Json", "Binary", "StringSet16", "StringSet32".
     /// For external vectors use "Json" with IndexVector=true, not a "Vector" field type.
     /// </summary>
     [JsonPropertyName("field_type")]
@@ -168,7 +179,6 @@ public sealed class DeleteByQueryRequest
     public int Offset { get; set; }
 
     [JsonPropertyName("length")]
-    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
     public int Length { get; set; } = 100;
 
     [JsonPropertyName("include_uncommitted")]
@@ -201,45 +211,29 @@ public sealed class UpdateDocument
 
 // ── Vector / inference types ────────────────────────────────────────
 
-/// <summary>
-/// Inference configuration for embedding generation at index time.
-/// Pass as object? in IndexMeta; use this class to construct.
-/// </summary>
+/// <summary>Builder for the engine's tagged Model2Vec configuration. Assign directly to IndexMeta.Inference or call ToJson().</summary>
 public sealed class InferenceConfig
 {
-    /// <summary>Model name for embedding generation.</summary>
-    [JsonPropertyName("model")]
     public string Model { get; set; } = "PotionBase2M";
-
-    /// <summary>Vector precision: "F32" or "I8".</summary>
-    [JsonPropertyName("precision")]
-    public string Precision { get; set; } = "F32";
-
-    /// <summary>Chunk size in bytes for text splitting.</summary>
-    [JsonPropertyName("chunk_size")]
     public int ChunkSize { get; set; } = 1000;
-
-    /// <summary>Vector similarity measure: "CosineSimilarity", "DotProduct", "EuclideanDistance".</summary>
-    [JsonPropertyName("vector_similarity")]
-    public string VectorSimilarity { get; set; } = "CosineSimilarity";
-
-    /// <summary>Quantization: "None", "Scalar", "TurboQuant".</summary>
-    [JsonPropertyName("quantization")]
     public string Quantization { get; set; } = "None";
+    public JsonObject ToJson() => SearchConfiguration.Model2Vec(Model, ChunkSize, Quantization);
+    public static implicit operator JsonObject(InferenceConfig configuration) => configuration.ToJson();
 }
 
-/// <summary>
-/// Spelling correction configuration for index creation.
-/// </summary>
+/// <summary>Reserved native spelling configuration shape. Dictionary-enabled indexes are rejected with pinned engine 3.4.1.</summary>
 public sealed class SpellingCorrectionConfig
 {
-    /// <summary>Max edit distance for corrections.</summary>
-    [JsonPropertyName("max_edit_distance")]
+    [JsonPropertyName("max_dictionary_edit_distance")]
     public int MaxEditDistance { get; set; } = 2;
-
-    /// <summary>Minimum word length for correction candidates.</summary>
-    [JsonPropertyName("min_word_length")]
-    public int MinWordLength { get; set; } = 2;
+    [JsonPropertyName("term_length_threshold")]
+    public int[]? TermLengthThreshold { get; set; }
+    [JsonPropertyName("count_threshold")]
+    public int CountThreshold { get; set; } = 1;
+    [JsonPropertyName("max_dictionary_entries")]
+    public int MaxDictionaryEntries { get; set; } = 100_000;
+    public JsonObject ToJson() => System.Text.Json.JsonSerializer.SerializeToNode(this, SeekStormJsonContext.Default.SpellingCorrectionConfig)!.AsObject();
+    public static implicit operator JsonObject(SpellingCorrectionConfig configuration) => configuration.ToJson();
 }
 
 /// <summary>
@@ -247,6 +241,10 @@ public sealed class SpellingCorrectionConfig
 /// </summary>
 public sealed class QueryRewritingConfig
 {
+    [JsonPropertyName("term_length_threshold")]
+    public int[]? TermLengthThreshold { get; set; }
+    public JsonObject ToJson() => System.Text.Json.JsonSerializer.SerializeToNode(this, SeekStormJsonContext.Default.QueryRewritingConfig)!.AsObject();
+    public static implicit operator JsonObject(QueryRewritingConfig configuration) => configuration.ToJson();
     /// <summary>
     /// Mode: "SearchOnly", "SearchSuggest", "SearchRewrite", "SuggestOnly".
     /// </summary>
@@ -255,21 +253,17 @@ public sealed class QueryRewritingConfig
 
     /// <summary>Enable spelling correction for queries >= this length.</summary>
     [JsonPropertyName("correct_threshold")]
-    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
-    public int CorrectThreshold { get; set; }
+    public int? CorrectThreshold { get; set; }
 
     /// <summary>Max edit distance for suggestions.</summary>
     [JsonPropertyName("distance")]
-    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
     public int Distance { get; set; } = 2;
 
     /// <summary>Enable query completion for queries >= this length.</summary>
     [JsonPropertyName("complete_threshold")]
-    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
-    public int CompleteThreshold { get; set; }
+    public int? CompleteThreshold { get; set; }
 
     /// <summary>Max number of returned suggestions.</summary>
     [JsonPropertyName("suggestion_length")]
-    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
-    public int SuggestionLength { get; set; }
+    public int? SuggestionLength { get; set; }
 }

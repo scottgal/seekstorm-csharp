@@ -35,6 +35,12 @@ internal static unsafe class NativeMethods
     private const string LibName = "seekstorm_ffi";
 
     [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern byte* seekstorm_validate_document(IntPtr handle, byte* documentJson, byte** outJson);
+
+    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+    public static extern byte* seekstorm_close_index_checked(IntPtr handle, byte** outJson);
+
+    [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
     public static extern byte* seekstorm_create_index(
         byte* indexPath,
         byte* metaJson,

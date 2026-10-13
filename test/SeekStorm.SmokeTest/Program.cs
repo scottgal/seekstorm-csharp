@@ -28,12 +28,12 @@ try
         Tokenizer = "UnicodeAlphanumeric",
         Stemmer = "None",
         DocumentCompression = "Snappy",
-        AccessType = "Mmap",
+        AccessType = "Mmap"
     };
     var schema = new[]
     {
         new SchemaField { Field = "title",  FieldType = "Text",      Store = true, IndexLexical = true,  Boost = 10 },
-        new SchemaField { Field = "body",   FieldType = "Text",      Store = true, IndexLexical = true },
+        new SchemaField { Field = "body",   FieldType = "Text",      Store = true, IndexLexical = true, DictionarySource = true },
         new SchemaField { Field = "url",    FieldType = "Text",      Store = true, IndexLexical = false },
         new SchemaField { Field = "price",  FieldType = "F32",       Store = true, IndexLexical = false, Facet = true },
         new SchemaField { Field = "date",   FieldType = "Timestamp", Store = true, IndexLexical = false, Facet = true },
@@ -61,6 +61,28 @@ try
     Require(results.ResultCountTotal > 0, "zero total count");
     Require(results.QueryTerms.Count > 0, "no query terms");
     Console.WriteLine($"ok ({results.ResultCount} hits, {results.ResultCountTotal} total)");
+
+    var countOnly = client.Search(new SearchRequest { Query = "document", Length = 0 });
+    Require(countOnly.Results.Count == 0 && countOnly.ResultCountTotal == 200, "length-zero search was not count-only");
+    client.DeleteDocumentsByQuery(new DeleteByQueryRequest { Query = "document", Length = 0 });
+    client.Commit();
+    Require(client.Search("document").ResultCountTotal == 200, "length-zero delete removed documents");
+    foreach (var invalid in new SearchRequest[] {
+        new() { Query = "document", Offset = -1 },
+        new() { Query = "document", Length = -1 },
+        new() { Query = "document", SearchMode = "Vectro" },
+        new() { Query = "document", QueryType = "Typo" },
+        new() { Query = "document", ResultType = "Typo" },
+        new() { Query = "document", Highlights = [new Highlight { Field = "body" }] },
+        new() { Query = "document", DistanceFields = [new DistanceField { Field = "point" }] },
+        new() { Query = "document", QueryRewriting = new JsonObject { ["mode"] = "Typo" } }
+    })
+    {
+        try { client.Search(invalid); throw new InvalidOperationException("invalid/unsupported query accepted"); }
+        catch (SeekStormException) { }
+    }
+    try { client.IndexDocument("""{"title":"bad price","price":"cheap"}"""); throw new InvalidOperationException("invalid numeric field accepted"); }
+    catch (SeekStormException) { }
 
     // 5. Search with offset
     Console.Write("  search (paged)... ");
@@ -137,15 +159,14 @@ try
     Require(sorted.Results.Count == 3, $"sorted count {sorted.Results.Count}");
     Console.WriteLine("ok");
 
-    // 12. Typo tolerance (needs dictionary at index creation; returns suggestions when available)
-    Console.Write("  search (typo)... ");
-    var typoReq = new SearchRequest
+    // 12. Broken optional upstream spelling must fail explicitly before allocation.
+    Console.Write("  spelling dictionary rejection... ");
+    using (var unsupported = new SeekStormClient())
     {
-        Query = "dokument",
-        QueryRewriting = JsonNode.Parse("""{"mode":"SearchSuggest","distance":2,"correct_threshold":3}""")!.AsObject(),
-    };
-    var typoResults = client.Search(typoReq);
-    Console.WriteLine($"ok ({typoResults.ResultCount} hits, {typoResults.Suggestions?.Count ?? 0} suggestions)");
+        ExpectRejected(() => unsupported.CreateIndex(indexPath + "_spelling",
+            new IndexMeta { SpellingCorrection = new SpellingCorrectionConfig() }, schema), "unsafe spelling dictionary was accepted");
+    }
+    Console.WriteLine("ok");
 
     // Real external-vector index, including exact role filtering and stable keys.
     var vectorPath = indexPath + "_vectors";
@@ -160,7 +181,7 @@ try
             }, [
                 new SchemaField { Field = "key", FieldType = "String16", Store = true, Facet = true },
                 new SchemaField { Field = "role", FieldType = "String16", Store = true, Facet = true },
-                new SchemaField { Field = "body", FieldType = "Text", Store = true, IndexLexical = true },
+                new SchemaField { Field = "body", FieldType = "Text", Store = true, IndexLexical = true, DictionarySource = true },
                 new SchemaField { Field = "embedding", FieldType = "Json", IndexVector = true }
             ]);
             float[] Vector(int position) { var v = new float[64]; v[position] = 1; return v; }
@@ -233,6 +254,15 @@ try
                 Fields = ["key"]
             });
             Require(filteredVector.Results.Count == 1 && filteredVector.Results[0].Document?["key"]?.GetValue<string>() == "a", "filter applied after top-k pagination");
+            try
+            {
+                var invalid = Evidence("a", "role-a", "invalid replacement", 0);
+                invalid["embedding"] = new JsonArray(JsonValue.Create(1.0));
+                vectors.UpsertDocument("key", "a", invalid);
+                throw new InvalidOperationException("invalid replacement accepted");
+            }
+            catch (SeekStormException) { }
+            Require(vectors.Search("production").Results.Count == 1, "invalid upsert deleted prior evidence");
             vectors.UpsertDocument("key", "a", Evidence("a", "role-a", "updated orchestration", 0));
             Require(vectors.Search("production").Results.Count == 0, "upsert retained old text");
             Require(vectors.Search("updated").Results.Count == 1, "upsert duplicated or lost key");
@@ -307,4 +337,15 @@ return exitCode;
 static void Require(bool condition, string message)
 {
     if (!condition) throw new InvalidOperationException(message);
+}
+
+static void ExpectRejected(Action action, string message)
+{
+    try { action(); }
+    catch (SeekStormException error)
+    {
+        Require(error.Message.Contains("spelling"), "operation failed for unrelated reason");
+        return;
+    }
+    throw new InvalidOperationException(message);
 }

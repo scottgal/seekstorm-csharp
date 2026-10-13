@@ -20,6 +20,14 @@ public static class SearchConfiguration
         };
     }
 
+    /// <summary>Tagged built-in model configuration; model weights may be downloaded by the engine.</summary>
+    public static JsonObject Model2Vec(string model = "PotionBase2M", int chunkSize = 1000, string quantization = "None")
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(model);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(chunkSize);
+        return new JsonObject { ["Model2Vec"] = new JsonObject { ["model"] = model, ["chunk_size"] = chunkSize, ["quantization"] = quantization } };
+    }
+
     /// <summary>Exact document filtering, unlike FieldFilter which selects searchable fields.</summary>
     public static JsonObject StringFacet(string field, params string[] values) => new()
     {

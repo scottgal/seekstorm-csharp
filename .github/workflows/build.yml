@@ -35,6 +35,7 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: stable
+          cache-workspaces: src/seekstorm-ffi
       - name: Build Rust FFI
         run: cargo build --release --locked --manifest-path src/seekstorm-ffi/Cargo.toml
       - name: Verify native panic containment
@@ -53,8 +54,11 @@ jobs:
         run: |
           cp runtimes/${{ matrix.rid }}/native/${{ matrix.binary }} test/SeekStorm.SmokeTest/bin/Release/net10.0/
           cp runtimes/${{ matrix.rid }}/native/${{ matrix.binary }} tests/SeekStorm.Bindings.Tests/bin/Release/net10.0/
-      - name: Run Release pipeline smoke test
-        run: dotnet run --project test/SeekStorm.SmokeTest -c Release --no-build
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Run Release pipeline smoke test and reject background native failures
+        run: python scripts/run-native-smoke.py
       - name: Run all unit and native integration tests
         run: dotnet test -c Release --no-build
       - uses: actions/upload-artifact@v4

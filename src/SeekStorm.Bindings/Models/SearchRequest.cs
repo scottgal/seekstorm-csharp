@@ -31,7 +31,6 @@ public sealed class SearchRequest
     public int Offset { get; set; }
 
     [JsonPropertyName("length")]
-    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
     public int Length { get; set; } = 10;
 
     /// <summary>Include uncommitted documents (real-time search).</summary>
@@ -191,7 +190,7 @@ public sealed class SearchResult
     /// <summary>Suggestions from query rewriting (typo correction, completion).</summary>
     [JsonPropertyName("suggestions")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
-    public List<Suggestion>? Suggestions { get; set; }
+    public List<string>? Suggestions { get; set; }
 
     /// <summary>Facet results when query_facets were requested.</summary>
     [JsonPropertyName("facets")]

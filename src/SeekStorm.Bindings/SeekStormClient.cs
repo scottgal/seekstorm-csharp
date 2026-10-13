@@ -25,6 +25,7 @@ namespace SeekStorm.Bindings;
 public sealed class SeekStormClient : IDisposable
 {
     private IndexHandle? _handle;
+    private string? _indexPath;
     private readonly object _sync = new();
     private bool _disposed;
 
@@ -43,6 +44,13 @@ public sealed class SeekStormClient : IDisposable
         lock (_sync)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
+            ArgumentNullException.ThrowIfNull(meta);
+            ArgumentNullException.ThrowIfNull(schema);
+            ArgumentException.ThrowIfNullOrWhiteSpace(indexPath);
+            if (meta.ShardCount != 1) throw new ArgumentOutOfRangeException(nameof(meta), "Embedded bindings require one shard.");
+            if (segmentBits != 11) throw new ArgumentOutOfRangeException(nameof(segmentBits));
+            var normalizedPath = Path.GetFullPath(indexPath);
+            if (SameIndexPath(normalizedPath)) throw new InvalidOperationException("Dispose the active index before recreating the same path.");
             string metaJson = Serialize(meta, SeekStormJsonContext.Default.IndexMeta);
             string schemaJson = Serialize(schema, SeekStormJsonContext.Default.SchemaFieldArray);
 
@@ -71,9 +79,7 @@ public sealed class SeekStormClient : IDisposable
                     NativeMethods.seekstorm_free_string(resultPtr);
             }
 
-            var previous = _handle;
-            _handle = new IndexHandle(rawHandle);
-            previous?.Dispose();
+            InstallIndex(rawHandle, normalizedPath);
 
         }
     }
@@ -91,6 +97,9 @@ public sealed class SeekStormClient : IDisposable
         lock (_sync)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
+            ArgumentException.ThrowIfNullOrWhiteSpace(indexPath);
+            var normalizedPath = Path.GetFullPath(indexPath);
+            if (SameIndexPath(normalizedPath)) return;
             IntPtr rawHandle = IntPtr.Zero;
             byte* resultPtr = null;
 
@@ -113,9 +122,7 @@ public sealed class SeekStormClient : IDisposable
                     NativeMethods.seekstorm_free_string(resultPtr);
             }
 
-            var previous = _handle;
-            _handle = new IndexHandle(rawHandle);
-            previous?.Dispose();
+            InstallIndex(rawHandle, normalizedPath);
 
         }
     }
@@ -126,7 +133,7 @@ public sealed class SeekStormClient : IDisposable
 
     // ── Document indexing ──────────────────────────────────────────
 
-    /// <summary>Index a single document as a JSON object string.</summary>
+    /// <summary>Queue a single JSON document. Call Commit to verify stored fields before durable reads.</summary>
     public unsafe void IndexDocument(string documentJson)
     {
         lock (_sync)
@@ -411,7 +418,7 @@ public sealed class SeekStormClient : IDisposable
 
     // ── IDisposable ────────────────────────────────────────────────
 
-    /// <summary>Replace a logical document using an stored exact String16 facet key. Native IDs may change.</summary>
+    /// <summary>Replace a logical document using a stored exact String16 facet key. Native IDs may change.</summary>
     public void UpsertDocument(string keyField, string key, System.Text.Json.Nodes.JsonObject document)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(keyField);
@@ -421,8 +428,12 @@ public sealed class SeekStormClient : IDisposable
             throw new ArgumentException("The document must contain the supplied stable key.", nameof(document));
         lock (_sync)
         {
+            var json = document.ToJsonString();
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            EnsureHandle();
+            unsafe { CallHandleJson(json, &NativeMethods.seekstorm_validate_document); }
             DeleteDocumentByKey(keyField, key);
-            IndexDocument(document.ToJsonString());
+            IndexDocument(json);
             Commit();
         }
     }
@@ -434,6 +445,7 @@ public sealed class SeekStormClient : IDisposable
         ArgumentException.ThrowIfNullOrWhiteSpace(key);
         lock (_sync)
         {
+            Commit(); // Drain queued writes before looking up a stable key.
             while (true)
             {
                 var found = Search(new SearchRequest
@@ -458,9 +470,39 @@ public sealed class SeekStormClient : IDisposable
         lock (_sync)
         {
             _disposed = true;
-            _handle?.Dispose();
-            _handle = null;
+            CloseCurrentIndex();
+        }
+    }
 
+    private bool SameIndexPath(string path) => _handle is not null && string.Equals(_indexPath, path,
+        OperatingSystem.IsWindows() || OperatingSystem.IsMacOS() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal);
+
+    private void InstallIndex(IntPtr rawHandle, string path)
+    {
+        var next = new IndexHandle(rawHandle);
+        try { CloseCurrentIndex(); }
+        catch { next.Dispose(); throw; }
+        _handle = next;
+        _indexPath = path;
+    }
+
+    private unsafe void CloseCurrentIndex()
+    {
+        if (_handle is null) return;
+        byte* resultPtr = null;
+        try
+        {
+            var errorPtr = NativeMethods.seekstorm_close_index_checked(_handle.DangerousGetHandle(), &resultPtr);
+            if (errorPtr != null) ThrowNativeError(errorPtr);
+        }
+        finally
+        {
+            // Native checked-close consumes the handle even when it reports an error.
+            _handle.SetHandleAsInvalid();
+            _handle.Dispose();
+            _handle = null;
+            _indexPath = null;
+            if (resultPtr != null) NativeMethods.seekstorm_free_string(resultPtr);
         }
     }
 

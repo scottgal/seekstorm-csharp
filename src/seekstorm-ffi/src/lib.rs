@@ -11,12 +11,13 @@
 //! - Pointer arguments are non-null and valid for the stated lifetime
 //! - Strings are valid UTF-8 and null-terminated
 //! - Handles returned by create/open are only used with the correct function family
+//! - Closing a handle requires exclusive ownership: no concurrent calls or later reuse
 
 use libc::c_char;
 use seekstorm::commit::Commit;
 use seekstorm::index::{
-    create_index, open_index, DeleteDocuments, Document, IndexArc, IndexDocument, IndexDocuments,
-    IndexMetaObject, UpdateDocuments,
+    create_index, open_index, Close, DeleteDocuments, Document, IndexArc, IndexDocument,
+    IndexDocuments, IndexMetaObject, UpdateDocuments,
 };
 use seekstorm::iterator::GetIterator;
 use seekstorm::search::{
@@ -25,8 +26,9 @@ use seekstorm::search::{
 use seekstorm::vector::{Embedding, Inference};
 use serde_json::Value;
 use std::ffi::{CStr, CString};
+use std::hash::{Hash, Hasher};
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use tokio::runtime::Runtime;
 
 // ── Global tokio runtime ──────────────────────────────────────────────
@@ -68,8 +70,115 @@ fn write_error(err: String, out_json: *mut *mut c_char) -> *mut c_char {
     to_owned_cstring(&err)
 }
 
+struct Handle {
+    index: IndexArc,
+    operation: Mutex<()>,
+    next_id: Mutex<usize>,
+    pending: Mutex<Vec<(usize, Option<u64>)>>,
+}
+
+fn make_handle(index: IndexArc) -> *mut libc::c_void {
+    let next = runtime().block_on(async { index.read().await.indexed_doc_count().await });
+    Box::into_raw(Box::new(Handle {
+        index,
+        operation: Mutex::new(()),
+        next_id: Mutex::new(next),
+        pending: Mutex::new(Vec::new()),
+    })) as *mut libc::c_void
+}
+
+unsafe fn state_from_handle(handle: *mut libc::c_void) -> &'static Handle {
+    assert!(!handle.is_null(), "null index handle");
+    &*(handle as *const Handle)
+}
 unsafe fn index_from_handle(handle: *mut libc::c_void) -> &'static IndexArc {
-    &*(handle as *const IndexArc)
+    &state_from_handle(handle).index
+}
+
+fn document_hash(document: &Document) -> u64 {
+    fn canonical(value: Value) -> Value {
+        match value {
+            Value::Object(object) => {
+                let mut entries: Vec<_> = object.into_iter().collect();
+                entries.sort_by(|a, b| a.0.cmp(&b.0));
+                Value::Object(
+                    entries
+                        .into_iter()
+                        .map(|(key, value)| (key, canonical(value)))
+                        .collect(),
+                )
+            }
+            Value::Array(values) => Value::Array(values.into_iter().map(canonical).collect()),
+            other => other,
+        }
+    }
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    canonical(serde_json::to_value(document).unwrap())
+        .to_string()
+        .hash(&mut hasher);
+    hasher.finish()
+}
+
+unsafe fn queue_checks(handle: *mut libc::c_void, documents: &[Document]) -> Result<(), String> {
+    let state = state_from_handle(handle);
+    let index = runtime().block_on(state.index.read());
+    let stored: Vec<_> = index
+        .schema_map
+        .values()
+        .filter(|field| field.store)
+        .map(|field| field.field.clone())
+        .collect();
+    let mut next = state.next_id.lock().map_err(|_| "index state poisoned")?;
+    let mut pending = state.pending.lock().map_err(|_| "index state poisoned")?;
+    for document in documents {
+        let fingerprint = if stored.is_empty() {
+            None
+        } else {
+            Some(document_hash(
+                &document
+                    .iter()
+                    .filter(|(key, _)| stored.contains(key))
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
+            ))
+        };
+        pending.push((*next, fingerprint));
+        *next += 1;
+    }
+    Ok(())
+}
+
+fn checked_commit(state: &Handle) -> Result<(), String> {
+    runtime().block_on(state.index.commit());
+    let index = runtime().block_on(state.index.read());
+    let expected = *state.next_id.lock().map_err(|_| "index state poisoned")?;
+    let committed = runtime().block_on(index.committed_doc_count());
+    if committed != expected {
+        return Err(format!(
+            "incomplete native commit: expected {expected} documents, committed {committed}"
+        ));
+    }
+    let mut pending = state.pending.lock().map_err(|_| "index state poisoned")?;
+    for (id, expected_hash) in pending.iter() {
+        if let Some(expected_hash) = expected_hash {
+            let document = runtime()
+                .block_on(index.get_document(
+                    *id,
+                    false,
+                    &None,
+                    &std::collections::HashSet::new(),
+                    &Vec::new(),
+                ))
+                .map_err(|error| format!("commit could not verify document {id}: {error}"))?;
+            if document_hash(&document) != *expected_hash {
+                return Err(format!(
+                    "commit stored-field verification failed for document {id}"
+                ));
+            }
+        }
+    }
+    pending.clear();
+    Ok(())
 }
 
 // The engine ignores unknown fields and mismatched facet types. Reject them at
@@ -81,28 +190,34 @@ fn validate_filters(index_arc: &IndexArc, req: &Value) -> Result<(), String> {
             let name = field
                 .as_str()
                 .ok_or("field_filter must contain field names")?;
-            if !index.schema_map.contains_key(name) {
+            if !index
+                .schema_map
+                .get(name)
+                .is_some_and(|field| field.index_lexical)
+            {
                 return Err(format!("unknown field_filter field: {name}"));
             }
         }
     }
-    if let Some(filters) = req.get("facet_filter").and_then(Value::as_array) {
-        for filter in filters {
-            let (kind, body) = filter
-                .as_object()
-                .and_then(|o| o.iter().next())
-                .ok_or("invalid facet filter")?;
-            let name = body
-                .get("field")
-                .and_then(Value::as_str)
-                .ok_or("facet filter requires field")?;
-            let schema = index
-                .schema_map
-                .get(name)
-                .ok_or_else(|| format!("unknown facet field: {name}"))?;
-            let actual = serde_json::to_value(&schema.field_type).map_err(|e| e.to_string())?;
-            if !schema.facet || actual.as_str() != Some(kind.as_str()) {
-                return Err(format!("facet type mismatch or disabled facet: {name}"));
+    for parameter in ["facet_filter", "query_facets"] {
+        if let Some(filters) = req.get(parameter).and_then(Value::as_array) {
+            for filter in filters {
+                let (kind, body) = filter
+                    .as_object()
+                    .and_then(|o| o.iter().next())
+                    .ok_or("invalid facet filter")?;
+                let name = body
+                    .get("field")
+                    .and_then(Value::as_str)
+                    .ok_or("facet filter requires field")?;
+                let schema = index
+                    .schema_map
+                    .get(name)
+                    .ok_or_else(|| format!("unknown facet field: {name}"))?;
+                let actual = serde_json::to_value(&schema.field_type).map_err(|e| e.to_string())?;
+                if !schema.facet || actual.as_str() != Some(kind.as_str()) {
+                    return Err(format!("facet type mismatch or disabled facet: {name}"));
+                }
             }
         }
     }
@@ -135,6 +250,280 @@ fn guarded<T>(action: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
     })
 }
 
+fn validate_request(request: &Value) -> Result<(), String> {
+    if !request.is_object() {
+        return Err("request must be an object".into());
+    }
+    for (name, allowed) in [
+        ("search_mode", &["Lexical", "Vector", "Hybrid"][..]),
+        (
+            "query_type",
+            &["Union", "Intersection", "Phrase", "Not"][..],
+        ),
+        ("result_type", &["Topk", "Count", "TopkCount"][..]),
+    ] {
+        if let Some(value) = request.get(name).filter(|v| !v.is_null()) {
+            if !value.as_str().is_some_and(|v| allowed.contains(&v)) {
+                return Err(format!("invalid {name}"));
+            }
+        }
+    }
+    for name in ["offset", "length", "skip", "docid"] {
+        if let Some(value) = request.get(name).filter(|v| !v.is_null()) {
+            if value.as_u64().is_none() {
+                return Err(format!("{name} must be a nonnegative integer"));
+            }
+        }
+    }
+    if let Some(value) = request.get("take").filter(|v| !v.is_null()) {
+        if value.as_i64().is_none() {
+            return Err("take must be a signed integer".into());
+        }
+    }
+    for name in [
+        "realtime",
+        "enable_empty_query",
+        "include_uncommitted",
+        "include_deleted",
+        "include_document",
+    ] {
+        if let Some(value) = request.get(name).filter(|v| !v.is_null()) {
+            if !value.is_boolean() {
+                return Err(format!("{name} must be boolean"));
+            }
+        }
+    }
+    if let Some(value) = request.get("similarity_threshold").filter(|v| !v.is_null()) {
+        if !value.as_f64().is_some_and(|n| (n as f32).is_finite()) {
+            return Err("similarity_threshold must be finite".into());
+        }
+    }
+    for name in ["highlights", "distance_fields"] {
+        if let Some(value) = request.get(name).filter(|v| !v.is_null()) {
+            let options = value
+                .as_array()
+                .ok_or_else(|| format!("{name} must be an array"))?;
+            if !options.is_empty() {
+                return Err(format!("{name} is not implemented by this binding"));
+            }
+        }
+    }
+    if let Some(rewriting) = request.get("query_rewriting").filter(|v| !v.is_null()) {
+        if !rewriting.is_object() {
+            return Err("query_rewriting must be an object".into());
+        }
+        if let Some(mode) = rewriting.get("mode") {
+            if !mode.as_str().is_some_and(|mode| {
+                [
+                    "SearchOnly",
+                    "SearchSuggest",
+                    "SearchRewrite",
+                    "SuggestOnly",
+                ]
+                .contains(&mode)
+            }) {
+                return Err("invalid query_rewriting mode".into());
+            }
+        }
+        if let Some(value) = rewriting
+            .get("term_length_threshold")
+            .filter(|v| !v.is_null())
+        {
+            if !value.as_array().is_some_and(|items| {
+                !items.is_empty() && items.iter().all(|v| v.as_u64().is_some())
+            }) {
+                return Err(
+                    "term_length_threshold must be a nonempty array of nonnegative integers".into(),
+                );
+            }
+        }
+        for name in [
+            "correct_threshold",
+            "complete_threshold",
+            "suggestion_length",
+            "distance",
+        ] {
+            if let Some(value) = rewriting.get(name).filter(|v| !v.is_null()) {
+                if value.as_u64().is_none() {
+                    return Err(format!("query_rewriting {name} must be nonnegative"));
+                }
+            }
+        }
+        if let Some(value) = rewriting.get("distance") {
+            if !value.as_u64().is_some_and(|n| n <= 2) {
+                return Err("query rewriting distance must be between 0 and 2".into());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_documents(index_arc: &IndexArc, documents: &[Document]) -> Result<(), String> {
+    let index = runtime().block_on(index_arc.read());
+    for document in documents {
+        if let Some(name) = document
+            .keys()
+            .find(|name| !index.schema_map.contains_key(*name))
+        {
+            return Err(format!("unknown document field: {name}"));
+        }
+        for schema in index.schema_map.values() {
+            let Some(value) = document.get(&schema.field) else {
+                continue;
+            };
+            if value.is_null() && !matches!(schema.field_type, seekstorm::index::FieldType::Json) {
+                return Err(format!(
+                    "omit null typed field {} instead of coercing it",
+                    schema.field
+                ));
+            }
+            let kind = serde_json::to_value(&schema.field_type).map_err(|e| e.to_string())?;
+            let valid = match kind.as_str().unwrap_or("") {
+                "Text" | "String16" | "String32" | "Binary" => value.is_string(),
+                "StringSet16" | "StringSet32" => value
+                    .as_array()
+                    .is_some_and(|values| values.iter().all(Value::is_string)),
+                "Bool" => value.is_boolean(),
+                "U8" => value.as_u64().is_some_and(|n| n <= u8::MAX as u64),
+                "U16" => value.as_u64().is_some_and(|n| n <= u16::MAX as u64),
+                "U32" => value.as_u64().is_some_and(|n| n <= u32::MAX as u64),
+                "U64" => value.as_u64().is_some(),
+                "I8" => value.as_i64().is_some_and(|n| i8::try_from(n).is_ok()),
+                "I16" => value.as_i64().is_some_and(|n| i16::try_from(n).is_ok()),
+                "I32" => value.as_i64().is_some_and(|n| i32::try_from(n).is_ok()),
+                "I64" | "Timestamp" => value.as_i64().is_some(),
+                "F32" => value.as_f64().is_some_and(|n| (n as f32).is_finite()),
+                "F64" => value.as_f64().is_some_and(f64::is_finite),
+                "Point" => value.as_array().is_some_and(|point| {
+                    point.len() == 2
+                        && point[0]
+                            .as_f64()
+                            .is_some_and(|n| (-90.0..=90.0).contains(&n))
+                        && point[1]
+                            .as_f64()
+                            .is_some_and(|n| (-180.0..=180.0).contains(&n))
+                }),
+                "Json" => true,
+                _ => false,
+            };
+            if !valid {
+                return Err(format!("invalid value for field {} ({kind})", schema.field));
+            }
+            if let Inference::External {
+                dimensions,
+                similarity,
+                ..
+            } = &index.meta.inference
+            {
+                if !schema.index_vector {
+                    continue;
+                }
+                let vector = value.as_array().ok_or_else(|| {
+                    format!("external vector field {} must be an array", schema.field)
+                })?;
+                let numbers: Vec<f32> = vector
+                    .iter()
+                    .map(|v| {
+                        v.as_f64()
+                            .map(|n| n as f32)
+                            .filter(|n| n.is_finite())
+                            .ok_or("vector elements must be finite numbers")
+                    })
+                    .collect::<Result<_, _>>()?;
+                if numbers.len() != *dimensions {
+                    return Err(format!(
+                        "vector dimensions do not match field {}",
+                        schema.field
+                    ));
+                }
+                if matches!(
+                    similarity,
+                    seekstorm::vector_similarity::VectorSimilarity::Cosine
+                ) {
+                    let norm: f32 = numbers.iter().map(|n| n * n).sum();
+                    if !norm.is_finite() || norm <= 0.0 {
+                        return Err("cosine vectors require a finite nonzero norm".into());
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn seekstorm_validate_document(
+    handle: *mut libc::c_void,
+    document_json: *const c_char,
+    out_json: *mut *mut c_char,
+) -> *mut c_char {
+    match guarded(|| {
+        let _operation = state_from_handle(handle)
+            .operation
+            .lock()
+            .map_err(|_| "index operation poisoned")?;
+        let document: Document =
+            serde_json::from_str(cstr_to_str(document_json)).map_err(|e| e.to_string())?;
+        validate_documents(index_from_handle(handle), &[document])?;
+        Ok(String::from(r#"{"status":"valid"}"#))
+    }) {
+        Ok(result) => {
+            write_output(result, out_json);
+            std::ptr::null_mut()
+        }
+        Err(error) => write_error(error, out_json),
+    }
+}
+
+fn validate_configuration(
+    meta: &IndexMetaObject,
+    schema: &[seekstorm::index::SchemaField],
+) -> Result<(), String> {
+    if meta.spelling_correction.is_some() {
+        return Err("spelling dictionaries are unavailable with SeekStorm 3.4.1: upstream dictionary commit can panic".into());
+    }
+    if schema.is_empty()
+        || schema.iter().any(|field| field.field.trim().is_empty())
+        || schema
+            .iter()
+            .map(|field| &field.field)
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+            != schema.len()
+    {
+        return Err("schema must have unique nonempty field names".into());
+    }
+    if let Inference::External {
+        dimensions,
+        precision,
+        ..
+    } = &meta.inference
+    {
+        if *dimensions == 0 || *dimensions > 65_536 {
+            return Err("external dimensions must be between 1 and 65536".into());
+        }
+        if !matches!(precision, seekstorm::vector::Precision::F32) {
+            return Err("external vectors currently require F32 precision".into());
+        }
+        if schema.iter().any(|field| {
+            field.index_vector && !matches!(field.field_type, seekstorm::index::FieldType::Json)
+        }) {
+            return Err("external vector fields currently require Json arrays".into());
+        }
+    }
+    if !matches!(meta.inference, Inference::External { .. })
+        && schema.iter().any(|field| {
+            field.index_vector && matches!(field.field_type, seekstorm::index::FieldType::Json)
+        })
+    {
+        return Err("vector-indexed Json fields require External inference; Model2Vec vector fields must be Text".into());
+    }
+    if matches!(meta.inference, Inference::None) && schema.iter().any(|field| field.index_vector) {
+        return Err("indexed vector fields require inference configuration".into());
+    }
+    Ok(())
+}
+
 // ── Public C-ABI exports ──────────────────────────────────────────────
 
 /// Create a new index. Returns null on success (out_json receives `{"id": N}`).
@@ -158,13 +547,37 @@ pub unsafe extern "C" fn seekstorm_create_index(
     out_json: *mut *mut c_char,
 ) -> *mut c_char {
     match guarded(|| -> Result<String, String> {
+        if out_handle.is_null() {
+            return Err("out_handle must not be null".into());
+        }
+        *out_handle = std::ptr::null_mut();
+        if segment_number_bits != 11 {
+            return Err(
+                "segment_number_bits must be 11: upstream reopening assumes this default".into(),
+            );
+        }
         let path = Path::new(cstr_to_str(index_path));
-        let meta: IndexMetaObject = serde_json::from_str(cstr_to_str(meta_json))
-            .map_err(|e| format!("invalid meta_json: {e}"))?;
+        let metadata: Value =
+            json_from_cstr(meta_json).map_err(|e| format!("invalid meta_json: {e}"))?;
+        let shard_count = metadata
+            .get("shard_count")
+            .map(|v| {
+                v.as_u64()
+                    .filter(|n| *n == 1)
+                    .ok_or("embedded bindings currently require shard_count = 1 for verified document IDs and bounded memory")
+            })
+            .transpose()?
+            .unwrap_or(1) as usize;
+        let meta: IndexMetaObject =
+            serde_json::from_value(metadata).map_err(|e| format!("invalid meta_json: {e}"))?;
+        if meta.spelling_correction.is_some() {
+            return Err("spelling dictionaries are unavailable with SeekStorm 3.4.1: upstream dictionary commit can panic; leave spelling_correction unset".into());
+        }
         let schema: Vec<seekstorm::index::SchemaField> =
             serde_json::from_str(cstr_to_str(schema_json))
                 .map_err(|e| format!("invalid schema_json: {e}"))?;
 
+        validate_configuration(&meta, &schema)?;
         let index_arc = runtime()
             .block_on(create_index(
                 path,
@@ -173,12 +586,12 @@ pub unsafe extern "C" fn seekstorm_create_index(
                 &Vec::new(),
                 segment_number_bits,
                 false,
-                None,
+                Some(shard_count),
             ))
             .map_err(|e| format!("create_index failed: {e}"))?;
 
         // Leak the Arc so the handle outlives this function
-        let handle = Box::into_raw(Box::new(index_arc)) as *mut libc::c_void;
+        let handle = make_handle(index_arc);
         if !out_handle.is_null() {
             unsafe {
                 *out_handle = handle;
@@ -202,12 +615,48 @@ pub unsafe extern "C" fn seekstorm_open_index(
     out_json: *mut *mut c_char,
 ) -> *mut c_char {
     match guarded(|| -> Result<String, String> {
+        if out_handle.is_null() {
+            return Err("out_handle must not be null".into());
+        }
+        *out_handle = std::ptr::null_mut();
         let path = Path::new(cstr_to_str(index_path));
+        // Validate the pinned engine's persisted layout before it allocates shard buffers.
+        let metadata: IndexMetaObject = serde_json::from_slice(
+            &std::fs::read(path.join("index.json"))
+                .map_err(|error| format!("cannot read index metadata: {error}"))?,
+        )
+        .map_err(|error| format!("invalid index metadata: {error}"))?;
+        if metadata.spelling_correction.is_some() {
+            return Err("spelling dictionaries are unavailable with SeekStorm 3.4.1".into());
+        }
+        let schema: Vec<seekstorm::index::SchemaField> = serde_json::from_slice(
+            &std::fs::read(path.join("schema.json"))
+                .map_err(|error| format!("cannot read index schema: {error}"))?,
+        )
+        .map_err(|error| format!("invalid index schema: {error}"))?;
+        validate_configuration(&metadata, &schema)?;
+        let shards = std::fs::read_dir(path.join("shards"))
+            .map_err(|error| error.to_string())?
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().is_dir())
+            .filter(|entry| entry.file_name().to_string_lossy().parse::<usize>().is_ok())
+            .count();
+        if shards != 1 {
+            return Err("embedded bindings require a persisted one-shard index".into());
+        }
         let index_arc = runtime()
             .block_on(open_index(path))
             .map_err(|e| format!("open_index failed: {e}"))?;
 
-        let handle = Box::into_raw(Box::new(index_arc)) as *mut libc::c_void;
+        let unsupported = runtime().block_on(async {
+            let index = index_arc.read().await;
+            index.meta.spelling_correction.is_some() || index.shard_count().await != 1
+        });
+        if unsupported {
+            runtime().block_on(index_arc.close());
+            return Err("index uses unsupported spelling dictionaries or multiple shards; rebuild with spelling unset and one shard".into());
+        }
+        let handle = make_handle(index_arc);
         if !out_handle.is_null() {
             unsafe {
                 *out_handle = handle;
@@ -223,14 +672,40 @@ pub unsafe extern "C" fn seekstorm_open_index(
     }
 }
 
-/// Close an index and free its resources.
+/// Close must break the engine's root/shard Arc cycle, not merely drop the handle.
+unsafe fn close_handle(handle: *mut libc::c_void) -> Result<(), String> {
+    if handle.is_null() {
+        return Ok(());
+    }
+    let state = Box::from_raw(handle as *mut Handle);
+    let verified = guarded(|| checked_commit(&state));
+    let closed = guarded(|| {
+        runtime().block_on(state.index.close());
+        Ok(())
+    });
+    verified.and(closed)
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn seekstorm_close_index(handle: *mut libc::c_void) {
-    if handle.is_null() {
-        return;
+    if let Err(error) = close_handle(handle) {
+        eprintln!("{error}");
     }
-    let _dropped = Box::from_raw(handle as *mut IndexArc);
-    // IndexArc (Arc<RwLock<Index>>) drops, potentially freeing the last reference
+}
+
+/// Explicit close reports failure; the handle is consumed even on failure.
+#[no_mangle]
+pub unsafe extern "C" fn seekstorm_close_index_checked(
+    handle: *mut libc::c_void,
+    out_json: *mut *mut c_char,
+) -> *mut c_char {
+    match close_handle(handle) {
+        Ok(()) => {
+            write_output(r#"{"status":"closed"}"#.into(), out_json);
+            std::ptr::null_mut()
+        }
+        Err(error) => write_error(error, out_json),
+    }
 }
 
 /// Index a single document. `document_json` is a JSON object with field→value mappings.
@@ -241,12 +716,18 @@ pub unsafe extern "C" fn seekstorm_index_document(
     out_json: *mut *mut c_char,
 ) -> *mut c_char {
     match guarded(|| -> Result<String, String> {
+        let _operation = state_from_handle(handle)
+            .operation
+            .lock()
+            .map_err(|_| "index operation poisoned")?;
         let index_arc = index_from_handle(handle);
         let doc: Document = serde_json::from_str(cstr_to_str(document_json))
             .map_err(|e| format!("invalid document_json: {e}"))?;
 
+        validate_documents(index_arc, std::slice::from_ref(&doc))?;
+        queue_checks(handle, std::slice::from_ref(&doc))?;
         runtime().block_on(index_arc.index_document(doc, seekstorm::index::FileType::None));
-        Ok(r#"{"status":"indexed"}"#.to_string())
+        Ok(r#"{"status":"queued"}"#.to_string())
     }) {
         Ok(result) => {
             write_output(result, out_json);
@@ -264,12 +745,18 @@ pub unsafe extern "C" fn seekstorm_index_documents(
     out_json: *mut *mut c_char,
 ) -> *mut c_char {
     match guarded(|| -> Result<String, String> {
+        let _operation = state_from_handle(handle)
+            .operation
+            .lock()
+            .map_err(|_| "index operation poisoned")?;
         let index_arc = index_from_handle(handle);
         let docs: Vec<Document> = serde_json::from_str(cstr_to_str(documents_json))
             .map_err(|e| format!("invalid documents_json: {e}"))?;
 
+        validate_documents(index_arc, &docs)?;
+        queue_checks(handle, &docs)?;
         runtime().block_on(index_arc.index_documents(docs));
-        Ok(r#"{"status":"indexed"}"#.to_string())
+        Ok(r#"{"status":"queued"}"#.to_string())
     }) {
         Ok(result) => {
             write_output(result, out_json);
@@ -287,10 +774,20 @@ pub unsafe extern "C" fn seekstorm_delete_documents(
     out_json: *mut *mut c_char,
 ) -> *mut c_char {
     match guarded(|| -> Result<String, String> {
+        let _operation = state_from_handle(handle)
+            .operation
+            .lock()
+            .map_err(|_| "index operation poisoned")?;
         let index_arc = index_from_handle(handle);
+        checked_commit(state_from_handle(handle))?;
         let ids: Vec<u64> = serde_json::from_str(cstr_to_str(doc_ids_json))
             .map_err(|e| format!("invalid doc_ids_json: {e}"))?;
 
+        state_from_handle(handle)
+            .pending
+            .lock()
+            .map_err(|_| "index state poisoned")?
+            .retain(|(id, _)| !ids.contains(&(*id as u64)));
         runtime().block_on(index_arc.delete_documents(ids));
         Ok(r#"{"status":"deleted"}"#.to_string())
     }) {
@@ -312,9 +809,14 @@ pub unsafe extern "C" fn seekstorm_delete_documents_by_query(
     out_json: *mut *mut c_char,
 ) -> *mut c_char {
     match guarded(|| -> Result<String, String> {
+        let _operation = state_from_handle(handle)
+            .operation
+            .lock()
+            .map_err(|_| "index operation poisoned")?;
         let index_arc = index_from_handle(handle);
         let req: Value =
             json_from_cstr(request_json).map_err(|e| format!("invalid request_json: {e}"))?;
+        validate_request(&req)?;
 
         let query = req["query"].as_str().unwrap_or("").to_string();
         let query_type = parse_query_type(req["query_type"].as_str());
@@ -330,6 +832,12 @@ pub unsafe extern "C" fn seekstorm_delete_documents_by_query(
         let result_sort = serde_json::from_value(optional_array(&req, "result_sort"))
             .map_err(|e| format!("invalid result_sort: {e}"))?;
         validate_filters(index_arc, &req)?;
+        if include_uncommitted {
+            checked_commit(state_from_handle(handle))?;
+        }
+        if length == 0 {
+            return Ok(r#"{"status":"deleted"}"#.into());
+        }
         let query_vector = match &runtime().block_on(index_arc.read()).meta.inference {
             Inference::External { dimensions, .. } if *dimensions > 0 => {
                 let mut unit = vec![0.0; *dimensions];
@@ -380,8 +888,11 @@ pub unsafe extern "C" fn seekstorm_commit(
     out_json: *mut *mut c_char,
 ) -> *mut c_char {
     match guarded(|| -> Result<String, String> {
-        let index_arc = index_from_handle(handle);
-        runtime().block_on(index_arc.commit());
+        let _operation = state_from_handle(handle)
+            .operation
+            .lock()
+            .map_err(|_| "index operation poisoned")?;
+        checked_commit(state_from_handle(handle))?;
         Ok(r#"{"status":"committed"}"#.to_string())
     }) {
         Ok(result) => {
@@ -401,15 +912,28 @@ pub unsafe extern "C" fn seekstorm_search(
     out_json: *mut *mut c_char,
 ) -> *mut c_char {
     match guarded(|| -> Result<String, String> {
+        let _operation = state_from_handle(handle)
+            .operation
+            .lock()
+            .map_err(|_| "index operation poisoned")?;
         let index_arc = index_from_handle(handle);
         let req: Value =
             json_from_cstr(request_json).map_err(|e| format!("invalid request_json: {e}"))?;
+        validate_request(&req)?;
 
         let query = req["query"].as_str().unwrap_or("").to_string();
         let search_mode = parse_search_mode(&req);
-        let dimensions = match &runtime().block_on(index_arc.read()).meta.inference {
-            Inference::External { dimensions, .. } => Some(*dimensions),
-            _ => None,
+        let vector_enabled = runtime()
+            .block_on(index_arc.read())
+            .schema_map
+            .values()
+            .any(|field| field.index_vector);
+        if !matches!(search_mode, SearchMode::Lexical) && !vector_enabled {
+            return Err("vector search requires an indexed vector field".into());
+        }
+        let dimensions = {
+            let index = runtime().block_on(index_arc.read());
+            (index.vector_dimensions_original > 0).then_some(index.vector_dimensions_original)
         };
         let query_vector = match req.get("query_vector") {
             None | Some(Value::Null) => None,
@@ -429,7 +953,16 @@ pub unsafe extern "C" fn seekstorm_search(
                     })
                     .collect::<Result<_, _>>()?;
                 if numbers.is_empty() || dimensions.is_some_and(|n| numbers.len() != n) {
-                    return Err("query_vector dimensions do not match the external index".into());
+                    return Err("query_vector dimensions do not match the index".into());
+                }
+                if matches!(
+                    runtime().block_on(index_arc.read()).vector_similarity,
+                    seekstorm::vector_similarity::VectorSimilarity::Cosine
+                ) {
+                    let norm: f32 = numbers.iter().map(|n| n * n).sum();
+                    if !norm.is_finite() || norm <= 0.0 {
+                        return Err("cosine vectors require a finite nonzero norm".into());
+                    }
                 }
                 Some(Embedding::F32(numbers))
             }
@@ -445,8 +978,10 @@ pub unsafe extern "C" fn seekstorm_search(
         } else {
             query_vector
         };
-        if dimensions.is_some()
-            && !matches!(search_mode, SearchMode::Lexical)
+        if matches!(
+            runtime().block_on(index_arc.read()).meta.inference,
+            Inference::External { .. }
+        ) && !matches!(search_mode, SearchMode::Lexical)
             && query_vector.is_none()
         {
             return Err("external vector search requires query_vector".into());
@@ -455,7 +990,15 @@ pub unsafe extern "C" fn seekstorm_search(
         let offset = req["offset"].as_u64().unwrap_or(0) as usize;
         let length = req["length"].as_u64().unwrap_or(10) as usize;
         let query_type = parse_query_type(req["query_type"].as_str());
-        let result_type = parse_result_type(req["result_type"].as_str());
+        let corpus_size =
+            runtime().block_on(async { index_arc.read().await.indexed_doc_count().await });
+        let offset = offset.min(corpus_size);
+        let length = length.min(corpus_size.saturating_sub(offset));
+        let result_type = if length == 0 {
+            ResultType::Count
+        } else {
+            parse_result_type(req["result_type"].as_str())
+        };
         let include_uncommitted = req["realtime"].as_bool().unwrap_or(false);
 
         // Invalid filters must fail, never silently broaden the query.
@@ -577,6 +1120,10 @@ pub unsafe extern "C" fn seekstorm_get_document(
     out_json: *mut *mut c_char,
 ) -> *mut c_char {
     match guarded(|| -> Result<String, String> {
+        let _operation = state_from_handle(handle)
+            .operation
+            .lock()
+            .map_err(|_| "index operation poisoned")?;
         let index_arc = index_from_handle(handle);
         let index = runtime().block_on(index_arc.read());
 
@@ -608,10 +1155,40 @@ pub unsafe extern "C" fn seekstorm_update_documents(
     out_json: *mut *mut c_char,
 ) -> *mut c_char {
     match guarded(|| -> Result<String, String> {
+        let _operation = state_from_handle(handle)
+            .operation
+            .lock()
+            .map_err(|_| "index operation poisoned")?;
         let index_arc = index_from_handle(handle);
         let updates: Vec<(u64, Document)> = serde_json::from_str(cstr_to_str(updates_json))
             .map_err(|e| format!("invalid updates_json (expected [[id, doc], ...]): {e}"))?;
 
+        let documents: Vec<_> = updates.iter().map(|(_, doc)| doc.clone()).collect();
+        validate_documents(index_arc, &documents)?;
+        checked_commit(state_from_handle(handle))?;
+        let mut unique = std::collections::HashSet::new();
+        for (id, _) in &updates {
+            if !unique.insert(*id) {
+                return Err("update IDs must be unique".into());
+            }
+            let existing = runtime().block_on(index_arc.get_iterator(
+                Some(*id),
+                0,
+                1,
+                false,
+                false,
+                Vec::new(),
+            ));
+            if existing.results.first().map(|hit| hit.doc_id) != Some(*id) {
+                return Err(format!("cannot update absent or deleted document {id}"));
+            }
+        }
+        state_from_handle(handle)
+            .pending
+            .lock()
+            .map_err(|_| "index state poisoned")?
+            .retain(|(id, _)| !updates.iter().any(|(removed, _)| *removed == *id as u64));
+        queue_checks(handle, &documents)?;
         runtime().block_on(index_arc.update_documents(updates));
         Ok(r#"{"status":"updated"}"#.to_string())
     }) {
@@ -633,23 +1210,25 @@ pub unsafe extern "C" fn seekstorm_iterate_documents(
     out_json: *mut *mut c_char,
 ) -> *mut c_char {
     match guarded(|| -> Result<String, String> {
+        let _operation = state_from_handle(handle)
+            .operation
+            .lock()
+            .map_err(|_| "index operation poisoned")?;
         let index_arc = index_from_handle(handle);
         let req: Value =
             json_from_cstr(request_json).map_err(|e| format!("invalid request_json: {e}"))?;
+        validate_request(&req)?;
 
         let docid = req["docid"].as_u64();
         let skip = req["skip"].as_u64().unwrap_or(0) as usize;
         let take = req["take"].as_i64().unwrap_or(100) as isize;
         let include_deleted = req["include_deleted"].as_bool().unwrap_or(false);
         let include_document = req["include_document"].as_bool().unwrap_or(true);
-        let fields: Vec<String> = req["fields"]
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let fields: Vec<String> = serde_json::from_value(optional_array(&req, "fields"))
+            .map_err(|e| format!("invalid iterator fields: {e}"))?;
+        if take == isize::MIN {
+            return Err("iterator take cannot be the minimum signed integer".into());
+        }
 
         let result = runtime().block_on(index_arc.get_iterator(
             docid,
@@ -716,25 +1295,34 @@ fn parse_search_mode(req: &Value) -> SearchMode {
 fn parse_query_rewriting(req: &Value) -> QueryRewriting {
     let qr = &req["query_rewriting"];
     let mode = qr["mode"].as_str().unwrap_or("SearchOnly");
+    let thresholds = qr
+        .get("term_length_threshold")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .map(|v| v.as_u64().unwrap() as usize)
+                .collect::<Vec<_>>()
+        });
     match mode {
         "SearchSuggest" => QueryRewriting::SearchSuggest {
             correct: qr["correct_threshold"].as_u64().map(|v| v as usize),
             distance: qr["distance"].as_u64().unwrap_or(2) as usize,
-            term_length_threshold: None,
+            term_length_threshold: thresholds,
             complete: qr["complete_threshold"].as_u64().map(|v| v as usize),
             length: qr["suggestion_length"].as_u64().map(|v| v as usize),
         },
         "SearchRewrite" => QueryRewriting::SearchRewrite {
             correct: qr["correct_threshold"].as_u64().map(|v| v as usize),
             distance: qr["distance"].as_u64().unwrap_or(2) as usize,
-            term_length_threshold: None,
+            term_length_threshold: thresholds,
             complete: qr["complete_threshold"].as_u64().map(|v| v as usize),
             length: qr["suggestion_length"].as_u64().map(|v| v as usize),
         },
         "SuggestOnly" => QueryRewriting::SuggestOnly {
             correct: qr["correct_threshold"].as_u64().map(|v| v as usize),
             distance: qr["distance"].as_u64().unwrap_or(2) as usize,
-            term_length_threshold: None,
+            term_length_threshold: thresholds,
             complete: qr["complete_threshold"].as_u64().map(|v| v as usize),
             length: qr["suggestion_length"].as_u64().map(|v| v as usize),
         },
@@ -755,6 +1343,48 @@ fn optional_array(request: &Value, field: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn create_rejects_missing_output_before_native_allocation() {
+        unsafe {
+            let error = seekstorm_create_index(
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                11,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            assert!(!error.is_null());
+            assert!(CStr::from_ptr(error)
+                .to_str()
+                .unwrap()
+                .contains("out_handle"));
+            seekstorm_free_string(error);
+        }
+    }
+
+    #[test]
+    fn create_rejects_oversized_segment_shift_before_reading_inputs() {
+        unsafe {
+            let mut handle = std::ptr::null_mut();
+            let error = seekstorm_create_index(
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                usize::MAX,
+                &mut handle,
+                std::ptr::null_mut(),
+            );
+            assert!(!error.is_null());
+            assert!(handle.is_null());
+            assert!(CStr::from_ptr(error)
+                .to_str()
+                .unwrap()
+                .contains("segment_number_bits"));
+            seekstorm_free_string(error);
+        }
+    }
+
     #[test]
     fn engine_panics_become_errors() {
         let result: Result<(), String> = guarded(|| panic!("synthetic engine failure"));

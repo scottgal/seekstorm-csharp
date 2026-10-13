@@ -31,6 +31,87 @@ public class SeekStormClientTests : IDisposable
         catch { /* best-effort cleanup */ }
     }
 
+    [Fact]
+    public void Invalid_index_switch_retains_the_active_index()
+    {
+        if (SkipNative) return;
+        SetupIndex(); IndexTestDocs(2);
+        Assert.Throws<SeekStormException>(() => _client!.OpenIndex(_indexPath + "_missing"));
+        Assert.Equal(2, _client!.Search("document").ResultCount);
+        Assert.Throws<SeekStormException>(() => _client.CreateIndex(_indexPath + "_invalid", DefaultMeta(), []));
+        Assert.Equal(2, _client.Search("document").ResultCount);
+        _client.OpenIndex(_indexPath); // Idempotent; does not reopen an active writer.
+        Assert.Throws<InvalidOperationException>(() => _client.CreateIndex(_indexPath, DefaultMeta(), DefaultSchema()));
+        Assert.Equal(2, _client.Search("document").ResultCount);
+    }
+
+    [Fact]
+    public void Unsafe_configuration_is_rejected_before_allocation()
+    {
+        if (SkipNative) return;
+        _client = new SeekStormClient();
+        var spelling = DefaultMeta(); spelling.SpellingCorrection = new SpellingCorrectionConfig();
+        Assert.Throws<SeekStormException>(() => _client.CreateIndex(_indexPath, spelling, DefaultSchema()));
+        Assert.False(Directory.Exists(_indexPath));
+        var model = DefaultMeta(); model.Inference = SearchConfiguration.Model2Vec();
+        var invalidVectorSchema = new[] { new SchemaField { Field = "embedding", FieldType = "Json", IndexVector = true } };
+        var vectorError = Assert.Throws<SeekStormException>(() => _client.CreateIndex(_indexPath, model, invalidVectorSchema));
+        Assert.Contains("Json", vectorError.Message);
+        var shards = DefaultMeta(); shards.ShardCount = 2;
+        Assert.Throws<ArgumentOutOfRangeException>(() => _client.CreateIndex(_indexPath, shards, DefaultSchema()));
+        foreach (var bits in new[] { -1, 0, 1, 10, 12, 13, 17, int.MaxValue })
+            Assert.Throws<ArgumentOutOfRangeException>(() => _client.CreateIndex(_indexPath, DefaultMeta(), DefaultSchema(), bits));
+        Assert.False(Directory.Exists(_indexPath));
+    }
+
+    [Fact]
+    public void Unknown_document_fields_and_null_typed_facets_are_not_silently_coerced()
+    {
+        if (SkipNative) return;
+        SetupIndex();
+        Assert.Throws<SeekStormException>(() => _client!.IndexDocument("{\"titel\":\"typo\",\"body\":\"document\"}"));
+        Assert.Throws<SeekStormException>(() => _client!.IndexDocument("{\"title\":\"document\",\"price\":null}"));
+        _client!.IndexDocument("{\"title\":\"document\"}");
+        _client.Commit();
+        Assert.Single(_client.Search("document").Results);
+    }
+
+    [Fact]
+    public void Updates_of_deleted_or_absent_ids_do_not_insert_replacements_or_partially_update()
+    {
+        if (SkipNative) return;
+        SetupIndex(); IndexTestDocs(2);
+        var ids = _client!.IterateDocuments(new IteratorRequest { Take = 2 }).Results.Select(hit => hit.DocId).ToArray();
+        _client.DeleteDocuments([ids[0]]);
+        var replacement = new Dictionary<string, object?> { ["title"] = "replacement", ["body"] = "replacement" };
+        Assert.Throws<SeekStormException>(() => _client.UpdateDocuments([
+            new() { Id = ids[1], Document = replacement }, new() { Id = ids[0], Document = replacement }]));
+        Assert.Throws<SeekStormException>(() => _client.UpdateDocuments([new() { Id = ulong.MaxValue, Document = replacement }]));
+        _client.Commit();
+        Assert.Empty(_client.Search("replacement").Results);
+        Assert.Single(_client.Search("document").Results);
+    }
+
+    [Fact]
+    public void Required_segment_configuration_can_commit_and_reopen()
+    {
+        if (SkipNative) return;
+        _client = new SeekStormClient();
+        _client.CreateIndex(_indexPath, DefaultMeta(), DefaultSchema(), 11);
+        _client.IndexDocument("{\"title\":\"boundarydocument\"}");
+        _client.Commit(); _client.Dispose();
+        _client = new SeekStormClient();
+        _client.OpenIndex(_indexPath);
+        Assert.Single(_client.Search("boundarydocument").Results);
+    }
+
+    [Fact]
+    public void Suggestions_deserialize_the_upstream_string_array_shape()
+    {
+        var result = JsonSerializer.Deserialize("{\"results\":[],\"suggestions\":[\"document\"]}", SeekStormJsonContext.Default.SearchResult);
+        Assert.Equal("document", Assert.Single(result!.Suggestions!));
+    }
+
     // ── Helpers ────────────────────────────────────────────────────
 
     private IndexMeta DefaultMeta() => new()
@@ -168,8 +249,7 @@ public class SeekStormClientTests : IDisposable
         };
 
         // Vector search won't work without embedding index, but shouldn't crash
-        var result = _client!.Search(request);
-        Assert.NotNull(result);
+        Assert.Throws<SeekStormException>(() => _client!.Search(request));
     }
 
     [Fact]
@@ -187,8 +267,7 @@ public class SeekStormClientTests : IDisposable
             SimilarityThreshold = 0.5f,
         };
 
-        var result = _client!.Search(request);
-        Assert.NotNull(result);
+        Assert.Throws<SeekStormException>(() => _client!.Search(request));
     }
 
     // ── Faceted search ─────────────────────────────────────────────
@@ -370,6 +449,18 @@ public class SeekStormClientTests : IDisposable
         _client!.Dispose();
 
         Assert.Throws<ObjectDisposedException>(() => _client.Search("test"));
+    }
+
+    [Fact]
+    public void Dispose_commits_pending_documents_and_releases_index_for_reopen()
+    {
+        if (SkipNative) return;
+        SetupIndex();
+        _client!.IndexDocument("""{"title":"pendingpersist","body":"queued before dispose"}""");
+        _client.Dispose();
+        _client = new SeekStormClient();
+        _client.OpenIndex(_indexPath);
+        Assert.Single(_client.Search("pendingpersist").Results);
     }
 
     // ── Model round-trip ───────────────────────────────────────────
