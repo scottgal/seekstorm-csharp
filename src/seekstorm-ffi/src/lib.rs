@@ -441,8 +441,8 @@ pub unsafe extern "C" fn seekstorm_search(
         } else {
             length
         };
-        if filtered_vectors && !query_facets.is_empty() {
-            return Err("facet aggregation with filtered vector search is not supported".into());
+        if !matches!(search_mode, SearchMode::Lexical) && !query_facets.is_empty() {
+            return Err("facet aggregation with vector or hybrid search is not supported".into());
         }
         let allowed = if filtered_vectors {
             let eligible = runtime().block_on(index_arc.search(
