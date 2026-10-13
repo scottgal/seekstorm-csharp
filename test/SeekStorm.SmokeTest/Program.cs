@@ -187,6 +187,24 @@ try
                 throw new InvalidOperationException("wrong vector dimensions accepted");
             }
             catch (SeekStormException) { }
+            foreach (var mode in new[] { "Vector", "Hybrid" })
+            {
+                try
+                {
+                    vectors.Search(new SearchRequest
+                    {
+                        Query = "production",
+                        SearchMode = mode,
+                        QueryVector = Vector(0),
+                        QueryFacets = JsonNode.Parse("""[{"String16":{"field":"role","prefix":"","length":10}}]""")!.AsArray()
+                    });
+                    throw new InvalidOperationException("unsupported vector facet aggregation accepted");
+                }
+                catch (SeekStormException ex)
+                {
+                    Require(ex.Message.Contains("facet aggregation"), "aggregation failed for unrelated reason");
+                }
+            }
             var hybrid = vectors.Search(new SearchRequest
             {
                 Query = "production agent",
@@ -233,6 +251,14 @@ try
             });
             vectors.Commit();
             Require(vectors.Search("updated").Results.Count == 1, "filtered deletion removed another role");
+            vectors.DeleteDocumentsByQuery(new DeleteByQueryRequest
+            {
+                Query = "database",
+                FacetFilter = new JsonArray((JsonNode)SearchConfiguration.StringFacet("role", "role-b"))
+            });
+            vectors.Commit();
+            Require(vectors.Search("database").Results.Count == 0, "positive filtered deletion failed on vector index");
+            vectors.UpsertDocument("key", "b", Evidence("b", "role-b", "database recovery", 1));
             vectors.DeleteDocumentByKey("key", "b");
         }
         using (var reopened = new SeekStormClient())

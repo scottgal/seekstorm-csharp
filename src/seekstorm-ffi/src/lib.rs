@@ -15,8 +15,8 @@
 use libc::c_char;
 use seekstorm::commit::Commit;
 use seekstorm::index::{
-    create_index, open_index, DeleteDocuments, DeleteDocumentsByQuery, Document, IndexArc,
-    IndexDocument, IndexDocuments, IndexMetaObject, UpdateDocuments,
+    create_index, open_index, DeleteDocuments, Document, IndexArc, IndexDocument, IndexDocuments,
+    IndexMetaObject, UpdateDocuments,
 };
 use seekstorm::iterator::GetIterator;
 use seekstorm::search::{
@@ -303,16 +303,39 @@ pub unsafe extern "C" fn seekstorm_delete_documents_by_query(
         let result_sort = serde_json::from_value(optional_array(&req, "result_sort"))
             .map_err(|e| format!("invalid result_sort: {e}"))?;
         validate_filters(index_arc, &req)?;
-        runtime().block_on(index_arc.delete_documents_by_query(
+        let query_vector = match &runtime().block_on(index_arc.read()).meta.inference {
+            Inference::External { dimensions, .. } if *dimensions > 0 => {
+                let mut unit = vec![0.0; *dimensions];
+                unit[0] = 1.0;
+                Some(Embedding::F32(unit))
+            }
+            _ => None,
+        };
+        let matches = runtime().block_on(index_arc.search(
             query,
+            query_vector,
             query_type,
+            SearchMode::Lexical,
+            false,
             offset,
             length,
+            ResultType::Topk,
             include_uncommitted,
             field_filter,
+            Vec::new(),
             facet_filter,
             result_sort,
+            QueryRewriting::SearchOnly,
         ));
+        runtime().block_on(
+            index_arc.delete_documents(
+                matches
+                    .results
+                    .into_iter()
+                    .map(|hit| hit.doc_id as u64)
+                    .collect(),
+            ),
+        );
         Ok(r#"{"status":"deleted"}"#.to_string())
     })() {
         Ok(result) => {
