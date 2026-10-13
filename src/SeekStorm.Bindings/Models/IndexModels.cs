@@ -104,7 +104,8 @@ public sealed class SchemaField
 
     /// <summary>
     /// Field type: "Text", "String16", "String32", "U8".."U64", "I8".."I64",
-    /// "F32", "F64", "Bool", "Timestamp", "Point", "Json", "Binary", "Vector".
+    /// "F32", "F64", "Bool", "Timestamp", "Point", "Json", "Binary".
+    /// For external vectors use "Json" with IndexVector=true, not a "Vector" field type.
     /// </summary>
     [JsonPropertyName("field_type")]
     public string FieldType { get; set; } = "Text";
@@ -116,6 +117,10 @@ public sealed class SchemaField
     /// <summary>Index the field for lexical search.</summary>
     [JsonPropertyName("index_lexical")]
     public bool IndexLexical { get; set; }
+
+    /// <summary>Index this Json field for vector/hybrid retrieval.</summary>
+    [JsonPropertyName("index_vector")]
+    public bool IndexVector { get; set; }
 
     /// <summary>Enable faceting on this field.</summary>
     [JsonPropertyName("facet")]
@@ -169,6 +174,15 @@ public sealed class DeleteByQueryRequest
     [JsonPropertyName("include_uncommitted")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
     public bool IncludeUncommitted { get; set; }
+
+    [JsonPropertyName("field_filter")]
+    public string[]? FieldFilter { get; set; }
+
+    [JsonPropertyName("facet_filter")]
+    public JsonArray? FacetFilter { get; set; }
+
+    [JsonPropertyName("result_sort")]
+    public ResultSort[]? ResultSort { get; set; }
 }
 
 /// <summary>

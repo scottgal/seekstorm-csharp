@@ -369,7 +369,7 @@ public class SeekStormClientTests : IDisposable
         SetupIndex();
         _client!.Dispose();
 
-        Assert.Throws<InvalidOperationException>(() => _client.Search("test"));
+        Assert.Throws<ObjectDisposedException>(() => _client.Search("test"));
     }
 
     // ── Model round-trip ───────────────────────────────────────────

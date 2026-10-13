@@ -7,115 +7,136 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish the verified package to NuGet
+        type: boolean
+        default: false
 
 permissions:
   contents: read
-  id-token: write
-  packages: write
 
 jobs:
   build-native:
-    name: Build (${{ matrix.target }})
+    name: Build (${{ matrix.rid }})
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
-            target: linux-x64
-            binary: libseekstorm_ffi.so
-          - os: ubuntu-24.04-arm
-            target: linux-arm64
-            binary: libseekstorm_ffi.so
-          - os: macos-latest
-            target: osx-arm64
-            binary: libseekstorm_ffi.dylib
-          - os: windows-latest
-            target: win-x64
-            binary: seekstorm_ffi.dll
-
+          - { os: ubuntu-24.04, rid: linux-x64, binary: libseekstorm_ffi.so }
+          - { os: ubuntu-24.04-arm, rid: linux-arm64, binary: libseekstorm_ffi.so }
+          - { os: macos-15, rid: osx-arm64, binary: libseekstorm_ffi.dylib }
+          - { os: macos-15-intel, rid: osx-x64, binary: libseekstorm_ffi.dylib }
+          - { os: windows-latest, rid: win-x64, binary: seekstorm_ffi.dll }
+          - { os: windows-11-arm, rid: win-arm64, binary: seekstorm_ffi.dll }
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: stable
-
       - name: Build Rust FFI
-        run: cd src/seekstorm-ffi && cargo build --release
-
-      - name: Copy native binary
-        run: |
-          mkdir -p runtimes/${{ matrix.target }}/native
-          cp src/seekstorm-ffi/target/release/${{ matrix.binary }} runtimes/${{ matrix.target }}/native/
+        run: cargo build --release --locked --manifest-path src/seekstorm-ffi/Cargo.toml
+      - name: Stage runtime preserving RID and native directories
         shell: bash
-
+        run: |
+          mkdir -p runtimes/${{ matrix.rid }}/native
+          cp src/seekstorm-ffi/target/release/${{ matrix.binary }} runtimes/${{ matrix.rid }}/native/
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '10.0.x'
-
-      - name: Restore and build C#
-        run: dotnet build -c Release
-
-      - name: Copy native for smoke test
-        run: cp runtimes/${{ matrix.target }}/native/${{ matrix.binary }} test/SeekStorm.SmokeTest/bin/Release/net10.0/
+      - run: dotnet build -c Release --warnaserror
+      - name: Copy native binary for project-reference tests
         shell: bash
-        continue-on-error: true
-
-      - name: Run smoke test
+        run: |
+          cp runtimes/${{ matrix.rid }}/native/${{ matrix.binary }} test/SeekStorm.SmokeTest/bin/Release/net10.0/
+          cp runtimes/${{ matrix.rid }}/native/${{ matrix.binary }} tests/SeekStorm.Bindings.Tests/bin/Release/net10.0/
+      - name: Run Release pipeline smoke test
         run: dotnet run --project test/SeekStorm.SmokeTest -c Release --no-build
-        if: runner.os != 'Windows'
-
-      - name: Run smoke test (Windows)
-        run: dotnet run --project test/SeekStorm.SmokeTest -c Release --no-build
-        if: runner.os == 'Windows'
-
-      - name: Run unit tests
-        run: dotnet test -c Release --no-build --filter "FullyQualifiedName~Model"
-        continue-on-error: true
-
-      - name: Upload native binary
-        uses: actions/upload-artifact@v4
+      - name: Run all unit and native integration tests
+        run: dotnet test -c Release --no-build
+      - uses: actions/upload-artifact@v4
         with:
-          name: native-${{ matrix.target }}
-          path: runtimes/${{ matrix.target }}/native/
+          name: native-${{ matrix.rid }}
+          path: runtimes/
+          if-no-files-found: error
 
   pack:
-    name: Pack NuGet
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: build-native
-    if: github.event_name != 'pull_request'
-
     steps:
       - uses: actions/checkout@v4
-
-      - name: Download all native binaries
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           pattern: native-*
           path: runtimes
           merge-multiple: true
-
-      - run: find runtimes -type f
-
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '10.0.x'
-
-      - name: Pack
-        run: dotnet pack src/SeekStorm.Bindings -c Release -o nupkgs
-
-      - name: Upload package
-        uses: actions/upload-artifact@v4
+      - run: dotnet pack src/SeekStorm.Bindings -c Release -o nupkgs --warnaserror
+      - run: python3 scripts/verify-package.py nupkgs
+      - uses: actions/upload-artifact@v4
         with:
           name: nuget-package
           path: nupkgs/*.nupkg
+          if-no-files-found: error
 
-      - name: NuGet login (OIDC)
-        uses: NuGet/login@v1
+  package-consumer:
+    name: Package consumer (${{ matrix.rid }})
+    needs: pack
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-24.04, rid: linux-x64 }
+          - { os: ubuntu-24.04-arm, rid: linux-arm64 }
+          - { os: macos-15, rid: osx-arm64 }
+          - { os: macos-15-intel, rid: osx-x64 }
+          - { os: windows-latest, rid: win-x64 }
+          - { os: windows-11-arm, rid: win-arm64 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: nuget-package
+          path: nupkgs
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - name: Restore actual package in isolated consumer
+        run: dotnet restore test/SeekStorm.PackageSmokeTest -r ${{ matrix.rid }} --source ./nupkgs --source https://api.nuget.org/v3/index.json
+      - name: Run package consumer without manual native copies
+        run: dotnet run --project test/SeekStorm.PackageSmokeTest -c Release -r ${{ matrix.rid }} --no-restore
+      - name: Publish NativeAOT consumer
+        run: dotnet publish test/SeekStorm.PackageSmokeTest -c Release -r ${{ matrix.rid }} --no-restore --warnaserror -o package-consumer
+      - name: Run NativeAOT consumer
+        shell: bash
+        run: |
+          if [[ "${{ runner.os }}" == Windows ]]; then
+            ./package-consumer/SeekStorm.PackageSmokeTest.exe
+          else
+            ./package-consumer/SeekStorm.PackageSmokeTest
+          fi
+
+  publish:
+    needs: package-consumer
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.publish)
+    runs-on: ubuntu-24.04
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: nuget-package
+          path: nupkgs
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - uses: NuGet/login@v1
         id: login
         with:
           user: mostlylucid
-
-      - name: Push to NuGet.org
-        if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
-        run: dotnet nuget push nupkgs/*.nupkg --api-key ${{ steps.login.outputs.NUGET_API_KEY }} --source https://api.nuget.org/v3/index.json
+      - run: dotnet nuget push nupkgs/*.nupkg --api-key ${{ steps.login.outputs.NUGET_API_KEY }} --source https://api.nuget.org/v3/index.json

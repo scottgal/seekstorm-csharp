@@ -1,0 +1,10 @@
+<Project>
+  <!-- Source consumers only. PackageSmokeTest must resolve natives from the NuGet package. -->
+  <Target Name="CopySourceNativeBinary" AfterTargets="Build"
+          Condition="'$(MSBuildProjectName)' == 'SeekStorm.SmokeTest' Or '$(MSBuildProjectName)' == 'SeekStorm.Bindings.Tests' Or '$(MSBuildProjectName)' == 'SeekStorm.Benchmarks'">
+    <ItemGroup>
+      <SourceNative Include="$(MSBuildThisFileDirectory)runtimes/$(NETCoreSdkRuntimeIdentifier)/native/*" />
+    </ItemGroup>
+    <Copy SourceFiles="@(SourceNative)" DestinationFolder="$(TargetDir)" SkipUnchangedFiles="true" />
+  </Target>
+</Project>

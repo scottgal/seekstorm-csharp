@@ -49,7 +49,7 @@ public sealed class SearchRequest
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string[]? FieldFilter { get; set; }
 
-    /// <summary>Field names to include in results (null = all stored fields).</summary>
+    /// <summary>Stored fields to hydrate into each hit document (null = no hydration).</summary>
     [JsonPropertyName("fields")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string[]? Fields { get; set; }
@@ -201,6 +201,9 @@ public sealed class SearchResult
 
 public sealed class SearchHit
 {
+    /// <summary>Selected stored fields when SearchRequest.Fields is specified.</summary>
+    [JsonPropertyName("document")]
+    public JsonObject? Document { get; set; }
     [JsonPropertyName("doc_id")]
     public ulong DocId { get; set; }
 

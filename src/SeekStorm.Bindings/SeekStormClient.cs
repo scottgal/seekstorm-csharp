@@ -25,6 +25,8 @@ namespace SeekStorm.Bindings;
 public sealed class SeekStormClient : IDisposable
 {
     private IndexHandle? _handle;
+    private readonly object _sync = new();
+    private bool _disposed;
 
     // ── Index lifecyle ─────────────────────────────────────────────
 
@@ -38,46 +40,42 @@ public sealed class SeekStormClient : IDisposable
     public unsafe void CreateIndex(
         string indexPath, IndexMeta meta, SchemaField[] schema, int segmentBits = 11)
     {
-        string metaJson = Serialize(meta, SeekStormJsonContext.Default.IndexMeta);
-        string schemaJson = Serialize(schema, SeekStormJsonContext.Default.SchemaFieldArray);
-
-        IntPtr rawHandle = IntPtr.Zero;
-        byte* errorPtr;
-        byte* resultPtr = null;
-
-        try
+        lock (_sync)
         {
-            int pathLen = System.Text.Encoding.UTF8.GetByteCount(indexPath);
-            int metaLen = System.Text.Encoding.UTF8.GetByteCount(metaJson);
-            int schemaLen = System.Text.Encoding.UTF8.GetByteCount(schemaJson);
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            string metaJson = Serialize(meta, SeekStormJsonContext.Default.IndexMeta);
+            string schemaJson = Serialize(schema, SeekStormJsonContext.Default.SchemaFieldArray);
 
-            Span<byte> pathBuf = stackalloc byte[pathLen + 1];
-            Span<byte> metaBuf = stackalloc byte[metaLen + 1];
-            Span<byte> schemaBuf = stackalloc byte[schemaLen + 1];
+            IntPtr rawHandle = IntPtr.Zero;
+            byte* errorPtr;
+            byte* resultPtr = null;
 
-            System.Text.Encoding.UTF8.GetBytes(indexPath, pathBuf);
-            System.Text.Encoding.UTF8.GetBytes(metaJson, metaBuf);
-            System.Text.Encoding.UTF8.GetBytes(schemaJson, schemaBuf);
-            pathBuf[pathLen] = 0;
-            metaBuf[metaLen] = 0;
-            schemaBuf[schemaLen] = 0;
-
-            fixed (byte* pp = pathBuf, mp = metaBuf, sp = schemaBuf)
+            try
             {
-                errorPtr = NativeMethods.seekstorm_create_index(
-                    pp, mp, sp, (nuint)segmentBits, &rawHandle, &resultPtr);
+                using var pathBuf = new Utf8Buffer(indexPath);
+                using var metaBuf = new Utf8Buffer(metaJson);
+                using var schemaBuf = new Utf8Buffer(schemaJson);
+
+                fixed (byte* pp = pathBuf.Bytes, mp = metaBuf.Bytes, sp = schemaBuf.Bytes)
+                {
+                    errorPtr = NativeMethods.seekstorm_create_index(
+                        pp, mp, sp, (nuint)segmentBits, &rawHandle, &resultPtr);
+                }
+
+                if (errorPtr != null)
+                    ThrowNativeError(errorPtr);
+            }
+            finally
+            {
+                if (resultPtr != null)
+                    NativeMethods.seekstorm_free_string(resultPtr);
             }
 
-            if (errorPtr != null)
-                ThrowNativeError(errorPtr);
-        }
-        finally
-        {
-            if (resultPtr != null)
-                NativeMethods.seekstorm_free_string(resultPtr);
-        }
+            var previous = _handle;
+            _handle = new IndexHandle(rawHandle);
+            previous?.Dispose();
 
-        _handle = new IndexHandle(rawHandle);
+        }
     }
 
     /// <summary>Async wrapper for CreateIndex.</summary>
@@ -90,32 +88,36 @@ public sealed class SeekStormClient : IDisposable
     /// </summary>
     public unsafe void OpenIndex(string indexPath)
     {
-        IntPtr rawHandle = IntPtr.Zero;
-        byte* resultPtr = null;
-
-        try
+        lock (_sync)
         {
-            int pathLen = System.Text.Encoding.UTF8.GetByteCount(indexPath);
-            Span<byte> pathBuf = stackalloc byte[pathLen + 1];
-            System.Text.Encoding.UTF8.GetBytes(indexPath, pathBuf);
-            pathBuf[pathLen] = 0;
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            IntPtr rawHandle = IntPtr.Zero;
+            byte* resultPtr = null;
 
-            byte* errorPtr;
-            fixed (byte* pp = pathBuf)
+            try
             {
-                errorPtr = NativeMethods.seekstorm_open_index(pp, &rawHandle, &resultPtr);
+                using var pathBuf = new Utf8Buffer(indexPath);
+
+                byte* errorPtr;
+                fixed (byte* pp = pathBuf.Bytes)
+                {
+                    errorPtr = NativeMethods.seekstorm_open_index(pp, &rawHandle, &resultPtr);
+                }
+
+                if (errorPtr != null)
+                    ThrowNativeError(errorPtr);
+            }
+            finally
+            {
+                if (resultPtr != null)
+                    NativeMethods.seekstorm_free_string(resultPtr);
             }
 
-            if (errorPtr != null)
-                ThrowNativeError(errorPtr);
-        }
-        finally
-        {
-            if (resultPtr != null)
-                NativeMethods.seekstorm_free_string(resultPtr);
-        }
+            var previous = _handle;
+            _handle = new IndexHandle(rawHandle);
+            previous?.Dispose();
 
-        _handle = new IndexHandle(rawHandle);
+        }
     }
 
     /// <summary>Async wrapper for OpenIndex.</summary>
@@ -127,8 +129,13 @@ public sealed class SeekStormClient : IDisposable
     /// <summary>Index a single document as a JSON object string.</summary>
     public unsafe void IndexDocument(string documentJson)
     {
-        EnsureHandle();
-        CallHandleJson(documentJson, &NativeMethods.seekstorm_index_document);
+        lock (_sync)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            EnsureHandle();
+            CallHandleJson(documentJson, &NativeMethods.seekstorm_index_document);
+
+        }
     }
 
     /// <summary>Async wrapper for IndexDocument.</summary>
@@ -138,8 +145,13 @@ public sealed class SeekStormClient : IDisposable
     /// <summary>Index multiple documents as a JSON array string.</summary>
     public unsafe void IndexDocuments(string documentsJson)
     {
-        EnsureHandle();
-        CallHandleJson(documentsJson, &NativeMethods.seekstorm_index_documents);
+        lock (_sync)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            EnsureHandle();
+            CallHandleJson(documentsJson, &NativeMethods.seekstorm_index_documents);
+
+        }
     }
 
     /// <summary>Async wrapper for IndexDocuments.</summary>
@@ -151,9 +163,14 @@ public sealed class SeekStormClient : IDisposable
     /// <summary>Delete documents by their IDs.</summary>
     public unsafe void DeleteDocuments(ulong[] docIds)
     {
-        EnsureHandle();
-        string json = Serialize(docIds, SeekStormJsonContext.Default.UInt64Array);
-        CallHandleJson(json, &NativeMethods.seekstorm_delete_documents);
+        lock (_sync)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            EnsureHandle();
+            string json = Serialize(docIds, SeekStormJsonContext.Default.UInt64Array);
+            CallHandleJson(json, &NativeMethods.seekstorm_delete_documents);
+
+        }
     }
 
     /// <summary>Async wrapper for DeleteDocuments.</summary>
@@ -163,9 +180,14 @@ public sealed class SeekStormClient : IDisposable
     /// <summary>Delete documents matching a query.</summary>
     public unsafe void DeleteDocumentsByQuery(DeleteByQueryRequest request)
     {
-        EnsureHandle();
-        string json = Serialize(request, SeekStormJsonContext.Default.DeleteByQueryRequest);
-        CallHandleJson(json, &NativeMethods.seekstorm_delete_documents_by_query);
+        lock (_sync)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            EnsureHandle();
+            string json = Serialize(request, SeekStormJsonContext.Default.DeleteByQueryRequest);
+            CallHandleJson(json, &NativeMethods.seekstorm_delete_documents_by_query);
+
+        }
     }
 
     /// <summary>Async wrapper for DeleteDocumentsByQuery.</summary>
@@ -177,8 +199,13 @@ public sealed class SeekStormClient : IDisposable
     /// <summary>Commit indexed documents to disk.</summary>
     public unsafe void Commit()
     {
-        EnsureHandle();
-        CallHandleOnly(&NativeMethods.seekstorm_commit);
+        lock (_sync)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            EnsureHandle();
+            CallHandleOnly(&NativeMethods.seekstorm_commit);
+
+        }
     }
 
     /// <summary>Async wrapper for Commit.</summary>
@@ -193,35 +220,46 @@ public sealed class SeekStormClient : IDisposable
     /// </summary>
     public unsafe SearchResult Search(SearchRequest request)
     {
-        EnsureHandle();
-        string requestJson = Serialize(request, SeekStormJsonContext.Default.SearchRequest);
-
-        byte* resultPtr = null;
-        try
+        lock (_sync)
         {
-            int byteCount = System.Text.Encoding.UTF8.GetByteCount(requestJson);
-            Span<byte> buffer = stackalloc byte[byteCount + 1];
-            System.Text.Encoding.UTF8.GetBytes(requestJson, buffer);
-            buffer[byteCount] = 0;
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            EnsureHandle();
+            string requestJson = Serialize(request, SeekStormJsonContext.Default.SearchRequest);
 
-            byte* errorPtr;
-            fixed (byte* buf = buffer)
+            byte* resultPtr = null;
+            try
             {
-                errorPtr = NativeMethods.seekstorm_search(
-                    _handle!.DangerousGetHandle(), buf, &resultPtr);
+                using var buffer = new Utf8Buffer(requestJson);
+
+                byte* errorPtr;
+                fixed (byte* buf = buffer.Bytes)
+                {
+                    errorPtr = NativeMethods.seekstorm_search(
+                        _handle!.DangerousGetHandle(), buf, &resultPtr);
+                }
+
+                if (errorPtr != null)
+                    ThrowNativeError(errorPtr);
+
+                var result = resultPtr != null
+                    ? DeserializeSearchResult(resultPtr)
+                    : new SearchResult();
+                if (request.Fields is not null)
+                    foreach (var hit in result.Results)
+                    {
+                        var document = System.Text.Json.Nodes.JsonNode.Parse(GetDocument((nuint)hit.DocId))!.AsObject();
+                        hit.Document = new();
+                        foreach (var field in request.Fields)
+                            if (document.TryGetPropertyValue(field, out var value)) hit.Document[field] = value?.DeepClone();
+                    }
+                return result;
+            }
+            finally
+            {
+                if (resultPtr != null)
+                    NativeMethods.seekstorm_free_string(resultPtr);
             }
 
-            if (errorPtr != null)
-                ThrowNativeError(errorPtr);
-
-            return resultPtr != null
-                ? DeserializeSearchResult(resultPtr)
-                : new SearchResult();
-        }
-        finally
-        {
-            if (resultPtr != null)
-                NativeMethods.seekstorm_free_string(resultPtr);
         }
     }
 
@@ -249,22 +287,27 @@ public sealed class SeekStormClient : IDisposable
     /// <summary>Get a document by its ID. Returns raw JSON.</summary>
     public unsafe string GetDocument(nuint docId)
     {
-        EnsureHandle();
-        byte* resultPtr = null;
-        try
+        lock (_sync)
         {
-            byte* errorPtr = NativeMethods.seekstorm_get_document(
-                _handle!.DangerousGetHandle(), docId, &resultPtr);
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            EnsureHandle();
+            byte* resultPtr = null;
+            try
+            {
+                byte* errorPtr = NativeMethods.seekstorm_get_document(
+                    _handle!.DangerousGetHandle(), docId, &resultPtr);
 
-            if (errorPtr != null)
-                ThrowNativeError(errorPtr);
+                if (errorPtr != null)
+                    ThrowNativeError(errorPtr);
 
-            return resultPtr != null ? ReadUtf8String(resultPtr) : "{}";
-        }
-        finally
-        {
-            if (resultPtr != null)
-                NativeMethods.seekstorm_free_string(resultPtr);
+                return resultPtr != null ? ReadUtf8String(resultPtr) : "{}";
+            }
+            finally
+            {
+                if (resultPtr != null)
+                    NativeMethods.seekstorm_free_string(resultPtr);
+            }
+
         }
     }
 
@@ -278,8 +321,13 @@ public sealed class SeekStormClient : IDisposable
     /// <param name="updatesJson">JSON array of [doc_id, {fields}] tuples.</param>
     public unsafe void UpdateDocuments(string updatesJson)
     {
-        EnsureHandle();
-        CallHandleJson(updatesJson, &NativeMethods.seekstorm_update_documents);
+        lock (_sync)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            EnsureHandle();
+            CallHandleJson(updatesJson, &NativeMethods.seekstorm_update_documents);
+
+        }
     }
 
     /// <summary>Async wrapper for UpdateDocuments.</summary>
@@ -317,41 +365,43 @@ public sealed class SeekStormClient : IDisposable
     /// <summary>Iterate through all documents in the index.</summary>
     public unsafe IteratorResult IterateDocuments(IteratorRequest request)
     {
-        EnsureHandle();
-        string json = Serialize(request, SeekStormJsonContext.Default.IteratorRequest);
-
-        byte* resultPtr = null;
-        try
+        lock (_sync)
         {
-            int byteCount = Encoding.UTF8.GetByteCount(json);
-            Span<byte> buffer = stackalloc byte[byteCount + 1];
-            Encoding.UTF8.GetBytes(json, buffer);
-            buffer[byteCount] = 0;
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            EnsureHandle();
+            string json = Serialize(request, SeekStormJsonContext.Default.IteratorRequest);
 
-            byte* errorPtr;
-            fixed (byte* buf = buffer)
+            byte* resultPtr = null;
+            try
             {
-                errorPtr = NativeMethods.seekstorm_iterate_documents(
-                    _handle!.DangerousGetHandle(), buf, &resultPtr);
+                using var buffer = new Utf8Buffer(json);
+
+                byte* errorPtr;
+                fixed (byte* buf = buffer.Bytes)
+                {
+                    errorPtr = NativeMethods.seekstorm_iterate_documents(
+                        _handle!.DangerousGetHandle(), buf, &resultPtr);
+                }
+
+                if (errorPtr != null)
+                    ThrowNativeError(errorPtr);
+
+                if (resultPtr != null)
+                {
+                    int resultLen = 0;
+                    while (resultPtr[resultLen] != 0) resultLen++;
+                    var resultSpan = new ReadOnlySpan<byte>(resultPtr, resultLen);
+                    return JsonSerializer.Deserialize(resultSpan,
+                        SeekStormJsonContext.Default.IteratorResult) ?? new IteratorResult();
+                }
+                return new IteratorResult();
+            }
+            finally
+            {
+                if (resultPtr != null)
+                    NativeMethods.seekstorm_free_string(resultPtr);
             }
 
-            if (errorPtr != null)
-                ThrowNativeError(errorPtr);
-
-            if (resultPtr != null)
-            {
-                int resultLen = 0;
-                while (resultPtr[resultLen] != 0) resultLen++;
-                var resultSpan = new ReadOnlySpan<byte>(resultPtr, resultLen);
-                return JsonSerializer.Deserialize(resultSpan,
-                    SeekStormJsonContext.Default.IteratorResult) ?? new IteratorResult();
-            }
-            return new IteratorResult();
-        }
-        finally
-        {
-            if (resultPtr != null)
-                NativeMethods.seekstorm_free_string(resultPtr);
         }
     }
 
@@ -361,10 +411,57 @@ public sealed class SeekStormClient : IDisposable
 
     // ── IDisposable ────────────────────────────────────────────────
 
+    /// <summary>Replace a logical document using an stored exact String16 facet key. Native IDs may change.</summary>
+    public void UpsertDocument(string keyField, string key, System.Text.Json.Nodes.JsonObject document)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(keyField);
+        ArgumentException.ThrowIfNullOrWhiteSpace(key);
+        ArgumentNullException.ThrowIfNull(document);
+        if (document[keyField]?.GetValue<string>() != key)
+            throw new ArgumentException("The document must contain the supplied stable key.", nameof(document));
+        lock (_sync)
+        {
+            DeleteDocumentByKey(keyField, key);
+            IndexDocument(document.ToJsonString());
+            Commit();
+        }
+    }
+
+    /// <summary>Delete all versions of one logical document. The key field must be a stored exact String16 facet.</summary>
+    public void DeleteDocumentByKey(string keyField, string key)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(keyField);
+        ArgumentException.ThrowIfNullOrWhiteSpace(key);
+        lock (_sync)
+        {
+            while (true)
+            {
+                var found = Search(new SearchRequest
+                {
+                    EnableEmptyQuery = true,
+                    Realtime = true,
+                    Length = 256,
+                    FacetFilter = new System.Text.Json.Nodes.JsonArray((System.Text.Json.Nodes.JsonNode)SearchConfiguration.StringFacet(keyField, key)),
+                    Fields = [keyField]
+                });
+                if (found.Results.Count == 0) return;
+                if (found.Results.Any(hit => hit.Document?[keyField]?.GetValue<string>() != key))
+                    throw new InvalidOperationException("The stable key field must be configured as a stored String16 facet.");
+                DeleteDocuments(found.Results.Select(hit => hit.DocId).ToArray());
+                Commit();
+            }
+        }
+    }
+
     public void Dispose()
     {
-        _handle?.Dispose();
-        _handle = null;
+        lock (_sync)
+        {
+            _disposed = true;
+            _handle?.Dispose();
+            _handle = null;
+
+        }
     }
 
     // ── Internal helpers ───────────────────────────────────────────
@@ -383,13 +480,10 @@ public sealed class SeekStormClient : IDisposable
         byte* resultPtr = null;
         try
         {
-            int byteCount = System.Text.Encoding.UTF8.GetByteCount(json);
-            Span<byte> buffer = stackalloc byte[byteCount + 1];
-            System.Text.Encoding.UTF8.GetBytes(json, buffer);
-            buffer[byteCount] = 0;
+            using var buffer = new Utf8Buffer(json);
 
             byte* errorPtr;
-            fixed (byte* buf = buffer)
+            fixed (byte* buf = buffer.Bytes)
             {
                 errorPtr = nativeFunc(
                     _handle!.DangerousGetHandle(), buf, &resultPtr);

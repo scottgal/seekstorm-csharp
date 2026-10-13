@@ -13,19 +13,16 @@
 //! - Handles returned by create/open are only used with the correct function family
 
 use libc::c_char;
+use seekstorm::commit::Commit;
 use seekstorm::index::{
-    create_index, open_index,
-    DeleteDocuments, DeleteDocumentsByQuery,
-    IndexArc, IndexDocument, IndexDocuments, IndexMetaObject,
-    UpdateDocuments, Document,
-};
-use seekstorm::search::{
-    QueryType, QueryRewriting, ResultType, Search, SearchMode, FacetFilter, QueryFacet,
-    ResultSort,
+    create_index, open_index, DeleteDocuments, DeleteDocumentsByQuery, Document, IndexArc,
+    IndexDocument, IndexDocuments, IndexMetaObject, UpdateDocuments,
 };
 use seekstorm::iterator::GetIterator;
-use seekstorm::commit::Commit;
-use seekstorm::vector::Embedding;
+use seekstorm::search::{
+    FacetFilter, QueryFacet, QueryRewriting, QueryType, ResultSort, ResultType, Search, SearchMode,
+};
+use seekstorm::vector::{Embedding, Inference};
 use serde_json::Value;
 use std::ffi::{CStr, CString};
 use std::path::Path;
@@ -36,16 +33,16 @@ use tokio::runtime::Runtime;
 
 fn runtime() -> &'static Runtime {
     static RT: OnceLock<Runtime> = OnceLock::new();
-    RT.get_or_init(|| {
-        Runtime::new().expect("failed to create tokio runtime")
-    })
+    RT.get_or_init(|| Runtime::new().expect("failed to create tokio runtime"))
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────
 
 unsafe fn cstr_to_str<'a>(ptr: *const c_char) -> &'a str {
     assert!(!ptr.is_null(), "null pointer passed to FFI");
-    CStr::from_ptr(ptr).to_str().expect("invalid UTF-8 in FFI string")
+    CStr::from_ptr(ptr)
+        .to_str()
+        .expect("invalid UTF-8 in FFI string")
 }
 
 unsafe fn json_from_cstr(ptr: *const c_char) -> serde_json::Result<Value> {
@@ -60,7 +57,9 @@ fn to_owned_cstring(s: &str) -> *mut c_char {
 
 fn write_output(output: String, out_json: *mut *mut c_char) {
     if !out_json.is_null() {
-        unsafe { *out_json = to_owned_cstring(&output); }
+        unsafe {
+            *out_json = to_owned_cstring(&output);
+        }
     }
 }
 
@@ -71,6 +70,43 @@ fn write_error(err: String, out_json: *mut *mut c_char) -> *mut c_char {
 
 unsafe fn index_from_handle(handle: *mut libc::c_void) -> &'static IndexArc {
     &*(handle as *const IndexArc)
+}
+
+// The engine ignores unknown fields and mismatched facet types. Reject them at
+// the boundary so a typo cannot silently remove an intended document restriction.
+fn validate_filters(index_arc: &IndexArc, req: &Value) -> Result<(), String> {
+    let index = runtime().block_on(index_arc.read());
+    if let Some(fields) = req.get("field_filter").and_then(Value::as_array) {
+        for field in fields {
+            let name = field
+                .as_str()
+                .ok_or("field_filter must contain field names")?;
+            if !index.schema_map.contains_key(name) {
+                return Err(format!("unknown field_filter field: {name}"));
+            }
+        }
+    }
+    if let Some(filters) = req.get("facet_filter").and_then(Value::as_array) {
+        for filter in filters {
+            let (kind, body) = filter
+                .as_object()
+                .and_then(|o| o.iter().next())
+                .ok_or("invalid facet filter")?;
+            let name = body
+                .get("field")
+                .and_then(Value::as_str)
+                .ok_or("facet filter requires field")?;
+            let schema = index
+                .schema_map
+                .get(name)
+                .ok_or_else(|| format!("unknown facet field: {name}"))?;
+            let actual = serde_json::to_value(&schema.field_type).map_err(|e| e.to_string())?;
+            if !schema.facet || actual.as_str() != Some(kind.as_str()) {
+                return Err(format!("facet type mismatch or disabled facet: {name}"));
+            }
+        }
+    }
+    Ok(())
 }
 
 // ── Public C-ABI exports ──────────────────────────────────────────────
@@ -103,21 +139,24 @@ pub unsafe extern "C" fn seekstorm_create_index(
             serde_json::from_str(cstr_to_str(schema_json))
                 .map_err(|e| format!("invalid schema_json: {e}"))?;
 
-        let index_arc = runtime().block_on(create_index(
-            path,
-            meta,
-            &schema,
-            &Vec::new(),
-            segment_number_bits,
-            false,
-            None,
-        ))
-        .map_err(|e| format!("create_index failed: {e}"))?;
+        let index_arc = runtime()
+            .block_on(create_index(
+                path,
+                meta,
+                &schema,
+                &Vec::new(),
+                segment_number_bits,
+                false,
+                None,
+            ))
+            .map_err(|e| format!("create_index failed: {e}"))?;
 
         // Leak the Arc so the handle outlives this function
         let handle = Box::into_raw(Box::new(index_arc)) as *mut libc::c_void;
         if !out_handle.is_null() {
-            unsafe { *out_handle = handle; }
+            unsafe {
+                *out_handle = handle;
+            }
         }
         Ok(r#"{"status":"created"}"#.to_string())
     })() {
@@ -138,12 +177,15 @@ pub unsafe extern "C" fn seekstorm_open_index(
 ) -> *mut c_char {
     match (|| -> Result<String, String> {
         let path = Path::new(cstr_to_str(index_path));
-        let index_arc = runtime().block_on(open_index(path))
+        let index_arc = runtime()
+            .block_on(open_index(path))
             .map_err(|e| format!("open_index failed: {e}"))?;
 
         let handle = Box::into_raw(Box::new(index_arc)) as *mut libc::c_void;
         if !out_handle.is_null() {
-            unsafe { *out_handle = handle; }
+            unsafe {
+                *out_handle = handle;
+            }
         }
         Ok(r#"{"status":"opened"}"#.to_string())
     })() {
@@ -157,9 +199,7 @@ pub unsafe extern "C" fn seekstorm_open_index(
 
 /// Close an index and free its resources.
 #[no_mangle]
-pub unsafe extern "C" fn seekstorm_close_index(
-    handle: *mut libc::c_void,
-) {
+pub unsafe extern "C" fn seekstorm_close_index(handle: *mut libc::c_void) {
     if handle.is_null() {
         return;
     }
@@ -247,8 +287,8 @@ pub unsafe extern "C" fn seekstorm_delete_documents_by_query(
 ) -> *mut c_char {
     match (|| -> Result<String, String> {
         let index_arc = index_from_handle(handle);
-        let req: Value = json_from_cstr(request_json)
-            .map_err(|e| format!("invalid request_json: {e}"))?;
+        let req: Value =
+            json_from_cstr(request_json).map_err(|e| format!("invalid request_json: {e}"))?;
 
         let query = req["query"].as_str().unwrap_or("").to_string();
         let query_type = parse_query_type(req["query_type"].as_str());
@@ -256,9 +296,22 @@ pub unsafe extern "C" fn seekstorm_delete_documents_by_query(
         let length = req["length"].as_u64().unwrap_or(10) as usize;
         let include_uncommitted = req["include_uncommitted"].as_bool().unwrap_or(false);
 
+        let field_filter = serde_json::from_value(optional_array(&req, "field_filter"))
+            .map_err(|e| format!("invalid field_filter: {e}"))?;
+        let facet_filter = serde_json::from_value(optional_array(&req, "facet_filter"))
+            .map_err(|e| format!("invalid facet_filter: {e}"))?;
+        let result_sort = serde_json::from_value(optional_array(&req, "result_sort"))
+            .map_err(|e| format!("invalid result_sort: {e}"))?;
+        validate_filters(index_arc, &req)?;
         runtime().block_on(index_arc.delete_documents_by_query(
-            query, query_type, offset, length, include_uncommitted,
-            Vec::new(), Vec::new(), Vec::new(),
+            query,
+            query_type,
+            offset,
+            length,
+            include_uncommitted,
+            field_filter,
+            facet_filter,
+            result_sort,
         ));
         Ok(r#"{"status":"deleted"}"#.to_string())
     })() {
@@ -299,20 +352,55 @@ pub unsafe extern "C" fn seekstorm_search(
 ) -> *mut c_char {
     match (|| -> Result<String, String> {
         let index_arc = index_from_handle(handle);
-        let req: Value = json_from_cstr(request_json)
-            .map_err(|e| format!("invalid request_json: {e}"))?;
+        let req: Value =
+            json_from_cstr(request_json).map_err(|e| format!("invalid request_json: {e}"))?;
 
         let query = req["query"].as_str().unwrap_or("").to_string();
-        let query_vector = req.get("query_vector")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                let f32s: Vec<f32> = arr.iter()
-                    .filter_map(|v| v.as_f64().map(|f| f as f32))
-                    .collect();
-                Embedding::F32(f32s)
-            });
-
         let search_mode = parse_search_mode(&req);
+        let dimensions = match &runtime().block_on(index_arc.read()).meta.inference {
+            Inference::External { dimensions, .. } => Some(*dimensions),
+            _ => None,
+        };
+        let query_vector = match req.get("query_vector") {
+            None | Some(Value::Null) => None,
+            Some(value) => {
+                let array = value.as_array().ok_or("query_vector must be an array")?;
+                let numbers: Vec<f32> = array
+                    .iter()
+                    .map(|value| {
+                        let number = value
+                            .as_f64()
+                            .ok_or("query_vector elements must be numbers")?
+                            as f32;
+                        if !number.is_finite() {
+                            return Err("query_vector elements must be finite");
+                        }
+                        Ok(number)
+                    })
+                    .collect::<Result<_, _>>()?;
+                if numbers.is_empty() || dimensions.is_some_and(|n| numbers.len() != n) {
+                    return Err("query_vector dimensions do not match the external index".into());
+                }
+                Some(Embedding::F32(numbers))
+            }
+        };
+        // 3.4.1 unnecessarily requires a vector even for lexical-only searches
+        // on external-vector indexes. A unit vector is unused by lexical ranking.
+        let query_vector = if query_vector.is_none() && matches!(search_mode, SearchMode::Lexical) {
+            dimensions.map(|n| {
+                let mut v = vec![0.0; n];
+                v[0] = 1.0;
+                Embedding::F32(v)
+            })
+        } else {
+            query_vector
+        };
+        if dimensions.is_some()
+            && !matches!(search_mode, SearchMode::Lexical)
+            && query_vector.is_none()
+        {
+            return Err("external vector search requires query_vector".into());
+        }
         let enable_empty_query = req["enable_empty_query"].as_bool().unwrap_or(false);
         let offset = req["offset"].as_u64().unwrap_or(0) as usize;
         let length = req["length"].as_u64().unwrap_or(10) as usize;
@@ -320,30 +408,82 @@ pub unsafe extern "C" fn seekstorm_search(
         let result_type = parse_result_type(req["result_type"].as_str());
         let include_uncommitted = req["realtime"].as_bool().unwrap_or(false);
 
-        // v2: full parameter support
-        let field_filter: Vec<String> = req["field_filter"].as_array()
-            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-            .unwrap_or_default();
-        let query_facets: Vec<QueryFacet> = req["query_facets"].as_array()
-            .map(|a| serde_json::from_value(Value::Array(a.clone())).unwrap_or_default())
-            .unwrap_or_default();
-        let facet_filter: Vec<FacetFilter> = req["facet_filter"].as_array()
-            .map(|a| serde_json::from_value(Value::Array(a.clone())).unwrap_or_default())
-            .unwrap_or_default();
-        let result_sort: Vec<ResultSort> = req["result_sort"].as_array()
-            .map(|a| serde_json::from_value(Value::Array(a.clone())).unwrap_or_default())
-            .unwrap_or_default();
+        // Invalid filters must fail, never silently broaden the query.
+        let field_filter: Vec<String> =
+            serde_json::from_value(optional_array(&req, "field_filter"))
+                .map_err(|e| format!("invalid field_filter: {e}"))?;
+        let query_facets: Vec<QueryFacet> =
+            serde_json::from_value(optional_array(&req, "query_facets"))
+                .map_err(|e| format!("invalid query_facets: {e}"))?;
+        let facet_filter: Vec<FacetFilter> =
+            serde_json::from_value(optional_array(&req, "facet_filter"))
+                .map_err(|e| format!("invalid facet_filter: {e}"))?;
+        let result_sort: Vec<ResultSort> =
+            serde_json::from_value(optional_array(&req, "result_sort"))
+                .map_err(|e| format!("invalid result_sort: {e}"))?;
         let query_rewriting = parse_query_rewriting(&req);
+        validate_filters(index_arc, &req)?;
 
-        let result = runtime().block_on(index_arc.search(
+        // SeekStorm 3.4.1 filters lexical hits, but its vector branch ignores facets.
+        // Intersect the complete ranked candidate set before pagination, never a top-k slice.
+        let filtered_vectors =
+            !facet_filter.is_empty() && !matches!(search_mode, SearchMode::Lexical);
+        let candidate_limit = if filtered_vectors {
+            let count =
+                runtime().block_on(async { index_arc.read().await.indexed_doc_count().await });
+            if count > 100_000 {
+                return Err(
+                    "filtered vector search currently supports at most 100000 indexed documents"
+                        .into(),
+                );
+            }
+            count.max(1)
+        } else {
+            length
+        };
+        if filtered_vectors && !query_facets.is_empty() {
+            return Err("facet aggregation with filtered vector search is not supported".into());
+        }
+        let allowed = if filtered_vectors {
+            let eligible = runtime().block_on(index_arc.search(
+                String::new(),
+                query_vector.clone(),
+                QueryType::Union,
+                SearchMode::Lexical,
+                true,
+                0,
+                candidate_limit,
+                ResultType::TopkCount,
+                include_uncommitted,
+                Vec::new(),
+                Vec::new(),
+                facet_filter.clone(),
+                Vec::new(),
+                QueryRewriting::SearchOnly,
+            ));
+            Some(
+                eligible
+                    .results
+                    .into_iter()
+                    .map(|hit| hit.doc_id)
+                    .collect::<std::collections::HashSet<_>>(),
+            )
+        } else {
+            None
+        };
+        let mut result = runtime().block_on(index_arc.search(
             query,
             query_vector,
             query_type,
             search_mode,
             enable_empty_query,
-            offset,
-            length,
-            result_type,
+            if filtered_vectors { 0 } else { offset },
+            candidate_limit,
+            if filtered_vectors {
+                ResultType::TopkCount
+            } else {
+                result_type.clone()
+            },
             include_uncommitted,
             field_filter,
             query_facets,
@@ -352,8 +492,22 @@ pub unsafe extern "C" fn seekstorm_search(
             query_rewriting,
         ));
 
-        let result_json = serde_json::to_string(&result)
-            .map_err(|e| format!("serialization failed: {e}"))?;
+        if let Some(allowed) = allowed {
+            result.results.retain(|hit| allowed.contains(&hit.doc_id));
+            result.result_count_total = result.results.len();
+            result.results = result
+                .results
+                .into_iter()
+                .skip(offset)
+                .take(length)
+                .collect();
+            if matches!(result_type, ResultType::Count) {
+                result.results.clear();
+            }
+            result.result_count = result.results.len();
+        }
+        let result_json =
+            serde_json::to_string(&result).map_err(|e| format!("serialization failed: {e}"))?;
         Ok(result_json)
     })() {
         Ok(result) => {
@@ -375,12 +529,17 @@ pub unsafe extern "C" fn seekstorm_get_document(
         let index_arc = index_from_handle(handle);
         let index = runtime().block_on(index_arc.read());
 
-        let doc = runtime().block_on(
-            index.get_document(doc_id, false, &None, &std::collections::HashSet::new(), &Vec::new())
-        ).map_err(|e| format!("get_document failed: {e}"))?;
+        let doc = runtime()
+            .block_on(index.get_document(
+                doc_id,
+                true,
+                &None,
+                &std::collections::HashSet::new(),
+                &Vec::new(),
+            ))
+            .map_err(|e| format!("get_document failed: {e}"))?;
 
-        serde_json::to_string(&doc)
-            .map_err(|e| format!("serialization failed: {e}"))
+        serde_json::to_string(&doc).map_err(|e| format!("serialization failed: {e}"))
     })() {
         Ok(result) => {
             write_output(result, out_json);
@@ -424,24 +583,33 @@ pub unsafe extern "C" fn seekstorm_iterate_documents(
 ) -> *mut c_char {
     match (|| -> Result<String, String> {
         let index_arc = index_from_handle(handle);
-        let req: Value = json_from_cstr(request_json)
-            .map_err(|e| format!("invalid request_json: {e}"))?;
+        let req: Value =
+            json_from_cstr(request_json).map_err(|e| format!("invalid request_json: {e}"))?;
 
         let docid = req["docid"].as_u64();
         let skip = req["skip"].as_u64().unwrap_or(0) as usize;
         let take = req["take"].as_i64().unwrap_or(100) as isize;
         let include_deleted = req["include_deleted"].as_bool().unwrap_or(false);
         let include_document = req["include_document"].as_bool().unwrap_or(true);
-        let fields: Vec<String> = req["fields"].as_array()
-            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        let fields: Vec<String> = req["fields"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default();
 
         let result = runtime().block_on(index_arc.get_iterator(
-            docid, skip, take, include_deleted, include_document, fields,
+            docid,
+            skip,
+            take,
+            include_deleted,
+            include_document,
+            fields,
         ));
 
-        serde_json::to_string(&result)
-            .map_err(|e| format!("serialization failed: {e}"))
+        serde_json::to_string(&result).map_err(|e| format!("serialization failed: {e}"))
     })() {
         Ok(result) => {
             write_output(result, out_json);
@@ -529,4 +697,12 @@ fn parse_query_rewriting(req: &Value) -> QueryRewriting {
 mod tests {
     // Integration tests belong in the C# layer; Rust-side tests
     // here would need a live seekstorm index on disk.
+}
+
+fn optional_array(request: &Value, field: &str) -> Value {
+    request
+        .get(field)
+        .filter(|value| !value.is_null())
+        .cloned()
+        .unwrap_or_else(|| Value::Array(Vec::new()))
 }

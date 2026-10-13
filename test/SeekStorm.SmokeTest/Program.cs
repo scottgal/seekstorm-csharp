@@ -57,27 +57,27 @@ try
     // 4. Lexical search
     Console.Write("  search (lexical)... ");
     var results = client.Search("document searchable");
-    Debug.Assert(results.Results.Count > 0, "no results");
-    Debug.Assert(results.ResultCountTotal > 0, "zero total count");
-    Debug.Assert(results.QueryTerms.Count > 0, "no query terms");
+    Require(results.Results.Count > 0, "no results");
+    Require(results.ResultCountTotal > 0, "zero total count");
+    Require(results.QueryTerms.Count > 0, "no query terms");
     Console.WriteLine($"ok ({results.ResultCount} hits, {results.ResultCountTotal} total)");
 
     // 5. Search with offset
     Console.Write("  search (paged)... ");
     var page1 = client.Search("document", offset: 0, length: 5);
     var page2 = client.Search("document", offset: 5, length: 5);
-    Debug.Assert(page1.Results.Count == 5, $"page1 count {page1.Results.Count}");
-    Debug.Assert(page2.Results.Count == 5, $"page2 count {page2.Results.Count}");
+    Require(page1.Results.Count == 5, $"page1 count {page1.Results.Count}");
+    Require(page2.Results.Count == 5, $"page2 count {page2.Results.Count}");
     var p1Ids = new HashSet<ulong>(page1.Results.Select(r => r.DocId));
     var p2Ids = new HashSet<ulong>(page2.Results.Select(r => r.DocId));
-    Debug.Assert(!p1Ids.Overlaps(p2Ids), "pages overlap");
+    Require(!p1Ids.Overlaps(p2Ids), "pages overlap");
     Console.WriteLine("ok");
 
     // 6. Get document
     Console.Write("  get_document... ");
     var docId = results.Results[0].DocId;
     var doc = client.GetDocument((nuint)docId);
-    Debug.Assert(doc.Contains("searchable"), "document content missing");
+    Require(doc.Contains("searchable"), "document content missing");
     Console.WriteLine("ok");
 
     // 7. Update document
@@ -88,7 +88,7 @@ try
     });
     client.Commit();
     var updated = client.Search("UPDATED");
-    Debug.Assert(updated.Results.Count > 0, "updated doc not found");
+    Require(updated.Results.Count > 0, "updated doc not found");
     Console.WriteLine("ok");
 
     // 8. Delete by query
@@ -100,7 +100,7 @@ try
     });
     client.Commit();
     var afterDel = client.Search("UPDATED");
-    Debug.Assert(afterDel.Results.Count == 0, "deleted doc still present");
+    Require(afterDel.Results.Count == 0, "deleted doc still present");
     Console.WriteLine("ok");
 
     // 9. Iterator
@@ -110,8 +110,8 @@ try
         Take = 10,
         IncludeDocument = true,
     });
-    Debug.Assert(iter.Results.Count > 0, "iterator returned zero docs");
-    Debug.Assert(iter.Results.Count <= 10, "iterator returned too many docs");
+    Require(iter.Results.Count > 0, "iterator returned zero docs");
+    Require(iter.Results.Count <= 10, "iterator returned too many docs");
     Console.WriteLine($"ok ({iter.Results.Count} docs)");
 
     // 10. Faceted search
@@ -122,7 +122,7 @@ try
         FacetFilter = JsonNode.Parse("""[{"F32":{"field":"price","filter":{"start":100,"end":200}}}]""")!.AsArray(),
     };
     var facetResults = client.Search(facetReq);
-    Debug.Assert(facetResults.Results.Count > 0, "facet filter got zero results");
+    Require(facetResults.Results.Count > 0, "facet filter got zero results");
     Console.WriteLine($"ok ({facetResults.ResultCount} hits)");
 
     // 11. Sort
@@ -134,7 +134,7 @@ try
         ResultSort = [new ResultSort { Field = "price", Order = "Ascending" }],
     };
     var sorted = client.Search(sortReq);
-    Debug.Assert(sorted.Results.Count == 3, $"sorted count {sorted.Results.Count}");
+    Require(sorted.Results.Count == 3, $"sorted count {sorted.Results.Count}");
     Console.WriteLine("ok");
 
     // 12. Typo tolerance (needs dictionary at index creation; returns suggestions when available)
@@ -147,33 +147,113 @@ try
     var typoResults = client.Search(typoReq);
     Console.WriteLine($"ok ({typoResults.ResultCount} hits, {typoResults.Suggestions?.Count ?? 0} suggestions)");
 
-    // 13. Vector search (won't find results without embedding index, but shouldn't crash)
-    Console.Write("  search (vector)... ");
-    var vecReq = new SearchRequest
+    // Real external-vector index, including exact role filtering and stable keys.
+    var vectorPath = indexPath + "_vectors";
+    try
     {
-        Query = "document",
-        SearchMode = "Vector",
-        QueryVector = Enumerable.Repeat(0.1f, 128).ToArray(),
-        SimilarityThreshold = 0.5f,
-    };
-    client.Search(vecReq);
-    Console.WriteLine("ok");
+        using (var vectors = new SeekStormClient())
+        {
+            vectors.CreateIndex(vectorPath, new IndexMeta
+            {
+                Name = "evidence",
+                Inference = SearchConfiguration.ExternalVectors(64)
+            }, [
+                new SchemaField { Field = "key", FieldType = "String16", Store = true, Facet = true },
+                new SchemaField { Field = "role", FieldType = "String16", Store = true, Facet = true },
+                new SchemaField { Field = "body", FieldType = "Text", Store = true, IndexLexical = true },
+                new SchemaField { Field = "embedding", FieldType = "Json", IndexVector = true }
+            ]);
+            float[] Vector(int position) { var v = new float[64]; v[position] = 1; return v; }
+            JsonObject Evidence(string key, string role, string body, int position) => new()
+            {
+                ["key"] = key,
+                ["role"] = role,
+                ["body"] = body,
+                ["embedding"] = new JsonArray(Vector(position).Select(x => (JsonNode?)JsonValue.Create(x)).ToArray())
+            };
+            vectors.UpsertDocument("key", "a", Evidence("a", "role-a", "production agent orchestration", 0));
+            vectors.UpsertDocument("key", "b", Evidence("b", "role-b", "database recovery", 1));
+            var semantic = vectors.Search(new SearchRequest
+            {
+                SearchMode = "Vector",
+                QueryVector = Vector(1),
+                SimilarityThreshold = 0.1f,
+                Fields = ["key"]
+            });
+            Require(semantic.Results.Count > 0 && semantic.Results[0].Document?["key"]?.GetValue<string>() == "b", "vector ranking failed");
+            try
+            {
+                vectors.Search(new SearchRequest { SearchMode = "Vector", QueryVector = new float[63] });
+                throw new InvalidOperationException("wrong vector dimensions accepted");
+            }
+            catch (SeekStormException) { }
+            var hybrid = vectors.Search(new SearchRequest
+            {
+                Query = "production agent",
+                SearchMode = "Hybrid",
+                QueryVector = Vector(0),
+                SimilarityThreshold = 0.1f,
+                FacetFilter = new System.Text.Json.Nodes.JsonArray((System.Text.Json.Nodes.JsonNode)SearchConfiguration.StringFacet("role", "role-a")),
+                Fields = ["key", "role"]
+            });
+            Require(hybrid.Results.Count == 1 && hybrid.Results[0].Document?["key"]?.GetValue<string>() == "a", "hybrid role filter failed");
+            var filteredVector = vectors.Search(new SearchRequest
+            {
+                SearchMode = "Vector",
+                QueryVector = Vector(1),
+                Length = 1,
+                FacetFilter = new System.Text.Json.Nodes.JsonArray((System.Text.Json.Nodes.JsonNode)SearchConfiguration.StringFacet("role", "role-a")),
+                Fields = ["key"]
+            });
+            Require(filteredVector.Results.Count == 1 && filteredVector.Results[0].Document?["key"]?.GetValue<string>() == "a", "filter applied after top-k pagination");
+            vectors.UpsertDocument("key", "a", Evidence("a", "role-a", "updated orchestration", 0));
+            Require(vectors.Search("production").Results.Count == 0, "upsert retained old text");
+            Require(vectors.Search("updated").Results.Count == 1, "upsert duplicated or lost key");
+            // Invalid filters must fail rather than silently widen the search.
+            try
+            {
+                vectors.Search(new SearchRequest { Query = "updated", FacetFilter = new JsonArray((JsonNode)new JsonObject { ["INVALID"] = true }) });
+                throw new InvalidOperationException("invalid facet accepted");
+            }
+            catch (SeekStormException) { }
+            try
+            {
+                vectors.Search(new SearchRequest
+                {
+                    Query = "updated",
+                    FacetFilter = new JsonArray((JsonNode)SearchConfiguration.StringFacet("missing_role", "role-a"))
+                });
+                throw new InvalidOperationException("unknown facet field accepted");
+            }
+            catch (SeekStormException) { }
+            vectors.DeleteDocumentsByQuery(new DeleteByQueryRequest
+            {
+                Query = "updated",
+                FacetFilter = new System.Text.Json.Nodes.JsonArray((System.Text.Json.Nodes.JsonNode)SearchConfiguration.StringFacet("role", "role-b"))
+            });
+            vectors.Commit();
+            Require(vectors.Search("updated").Results.Count == 1, "filtered deletion removed another role");
+            vectors.DeleteDocumentByKey("key", "b");
+        }
+        using (var reopened = new SeekStormClient())
+        {
+            reopened.OpenIndex(vectorPath);
+            Require(reopened.Search("updated").Results.Count == 1, "reopen lost upsert");
+            Require(reopened.Search("database").Results.Count == 0, "reopen resurrected deletion");
+        }
+        Console.WriteLine("  vector ranking, hybrid role filtering, stable upsert, filtered deletion and reopen... ok");
+    }
+    finally { if (Directory.Exists(vectorPath)) Directory.Delete(vectorPath, true); }
 
-    // 14. Hybrid search
-    Console.Write("  search (hybrid)... ");
-    var hybReq = new SearchRequest
-    {
-        Query = "document",
-        SearchMode = "Hybrid",
-        QueryVector = Enumerable.Repeat(0.1f, 128).ToArray(),
-        SimilarityThreshold = 0.5f,
-    };
-    client.Search(hybReq);
-    Console.WriteLine("ok");
+    // Large JSON inputs previously used unbounded stack allocation.
+    client.IndexDocument(new JsonObject { ["title"] = "largepayload", ["body"] = new string('x', 2_000_000) }.ToJsonString());
+    client.Commit();
+    Require(client.Search("largepayload").Results.Count == 1, "large document not searchable");
+    Console.WriteLine("  2 MB document input... ok");
 
     // Done
     stopwatch.Stop();
-    Console.WriteLine($"\nAll {14} tests passed in {stopwatch.Elapsed.TotalSeconds:F1}s.");
+    Console.WriteLine($"\nAll pipeline checks passed in {stopwatch.Elapsed.TotalSeconds:F1}s.");
 }
 catch (Exception ex)
 {
@@ -188,3 +268,8 @@ finally
 }
 
 return exitCode;
+
+static void Require(bool condition, string message)
+{
+    if (!condition) throw new InvalidOperationException(message);
+}

@@ -1,42 +1,18 @@
 #!/usr/bin/env bash
-# Build script for SeekStorm C# SDK
-# Requires: Rust toolchain (for FFI crate), .NET SDK 10.0+
-
 set -euo pipefail
-
 PROJECT_ROOT="$(cd "$(dirname "$0")" && pwd)"
-
-echo "==> Building Rust FFI crate (seekstorm-ffi)..."
-
-RUST_DIR="$PROJECT_ROOT/src/seekstorm-ffi"
-if command -v cargo &>/dev/null; then
-    cd "$RUST_DIR"
-    cargo build --release
-    echo "    Rust FFI built → target/release/"
-else
-    echo "    WARNING: Rust not found — skipping FFI crate build."
-    echo "    Install Rust: https://rustup.rs"
-fi
-
-echo "==> Building C# SDK (SeekStorm.Bindings)..."
-
-CSHARP_DIR="$PROJECT_ROOT/src/SeekStorm.Bindings"
-cd "$CSHARP_DIR"
-dotnet build -c Release
-
-echo "==> Verifying AOT compatibility..."
-# PublishAot=true is set in the csproj; this confirms it compiles
-# Full publish requires native binaries in runtimes/ — skipped here.
-dotnet build -c Release /p:PublishAot=true --no-restore 2>&1 || true
-
-echo "==> Building benchmarks..."
-cd "$PROJECT_ROOT/bench/SeekStorm.Benchmarks"
-dotnet build -c Release
-
-echo "==> Done."
-echo ""
-echo "To publish AOT (requires native binaries):"
-echo "  dotnet publish src/SeekStorm.Bindings -c Release -r <rid>"
-echo ""
-echo "To run benchmarks (requires native binary + index data):"
-echo "  dotnet run -c Release --project bench/SeekStorm.Benchmarks"
+cd "$PROJECT_ROOT"
+command -v cargo >/dev/null || { echo "Rust is required: https://rustup.rs" >&2; exit 1; }
+case "$(uname -s)-$(uname -m)" in
+  Darwin-arm64) rid=osx-arm64; binary=libseekstorm_ffi.dylib ;;
+  Darwin-x86_64) rid=osx-x64; binary=libseekstorm_ffi.dylib ;;
+  Linux-x86_64) rid=linux-x64; binary=libseekstorm_ffi.so ;;
+  Linux-aarch64) rid=linux-arm64; binary=libseekstorm_ffi.so ;;
+  *) echo "Use the CI native build steps for this host." >&2; exit 1 ;;
+esac
+cargo build --release --locked --manifest-path src/seekstorm-ffi/Cargo.toml
+mkdir -p "runtimes/$rid/native"
+cp "src/seekstorm-ffi/target/release/$binary" "runtimes/$rid/native/"
+dotnet build -c Release --warnaserror
+dotnet test -c Release --no-build
+dotnet run --project test/SeekStorm.SmokeTest -c Release --no-build

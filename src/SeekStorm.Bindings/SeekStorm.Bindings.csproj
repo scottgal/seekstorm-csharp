@@ -14,7 +14,7 @@
 
     <!-- NuGet packaging -->
     <PackageId>SeekStorm.Bindings</PackageId>
-    <Version>0.1.0</Version>
+    <Version>0.2.0</Version>
     <Authors>SeekStorm Contributors</Authors>
     <Description>High-performance, AOT-compatible C# FFI bindings for the SeekStorm search library</Description>
     <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
@@ -30,7 +30,7 @@
   <!-- Uses glob pattern; only existing directories are included -->
   <ItemGroup>
     <None Include="../../runtimes/**/native/*"
-          Pack="true" PackagePath="runtimes/%(RecursiveDir)/%(Filename)%(Extension)" />
+          Pack="true" PackagePath="runtimes/%(RecursiveDir)%(Filename)%(Extension)" />
     <None Include="../../README.md"
           Pack="true" PackagePath="/" />
   </ItemGroup>

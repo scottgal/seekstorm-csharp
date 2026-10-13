@@ -1,6 +1,6 @@
 [package]
 name = "seekstorm-ffi"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "C-ABI FFI bindings for the SeekStorm search library"
 license = "Apache-2.0"
@@ -10,7 +10,7 @@ crate-type = ["cdylib"]
 name = "seekstorm_ffi"
 
 [dependencies]
-seekstorm = "3"
+seekstorm = "=3.4.1"
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
 libc = "0.2"
