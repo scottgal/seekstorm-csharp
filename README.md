@@ -1,6 +1,6 @@
 # SeekStorm C# SDK
 
-[![NuGet](https://img.shields.io/badge/nuget-v0.2.3-blue)](https://www.nuget.org/packages/SeekStorm.Bindings)
+[![NuGet](https://img.shields.io/badge/nuget-v0.2.4-blue)](https://www.nuget.org/packages/SeekStorm.Bindings)
 [![.NET](https://img.shields.io/badge/.NET-10.0-purple)](https://dotnet.microsoft.com/)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
 
@@ -170,7 +170,7 @@ Documents and results cross the FFI boundary as UTF-8 JSON, matching the format 
 Apache 2.0, matching [SeekStorm's license](https://github.com/SeekStorm/SeekStorm).
 
 
-## Binding contract and upstream limits (0.2.3)
+## Binding contract and upstream limits (0.2.4)
 
 This release pins **unmodified SeekStorm 3.4.1**. It does not fork or patch the engine.
 Embedded indexes currently require **one shard** and `segmentBits = 11`. This bounds the default 400 MB-per-shard posting buffer and makes submitted
